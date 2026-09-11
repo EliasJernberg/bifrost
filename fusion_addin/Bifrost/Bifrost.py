@@ -54,6 +54,7 @@ DEFAULT_ADDIN_CONFIG = {
     "selftest_seconds": 3.0,
     "selftest_wait_seconds": 600.0,
     "selftest_image_dir": "",
+    "selftest_settle_seconds": 3.0,
     "log_path": "",
     "log_level": "info",
 }
@@ -339,30 +340,55 @@ class BifrostState(object):
 
     # -- self test -----------------------------------------------------
 
-    def wait_for_viewport(self, timeout):
-        """Block until a design with a usable camera is open, or give up."""
+    def camera_state(self):
+        """A comparable snapshot of the current camera, or None."""
+        try:
+            viewport = self.app.activeViewport
+            if viewport is None:
+                return None
+            camera = viewport.camera
+            eye = (camera.eye.x, camera.eye.y, camera.eye.z)
+            target = (camera.target.x, camera.target.y, camera.target.z)
+            if v_len(v_sub(eye, target)) <= 1e-9:
+                return None
+            return (eye, target, round(camera.viewExtents, 6))
+        except Exception:
+            return None
+
+    def wait_for_viewport(self, timeout, settle=3.0):
+        """Block until a design is open and its camera has stopped moving.
+
+        A camera exists a good while before the document has finished loading,
+        and Fusion fits the view once it has. Starting the self test on the
+        half-loaded view would measure the wrong thing, so wait until the same
+        camera comes back unchanged for `settle` seconds.
+        """
         deadline = time.time() + timeout
+        last = None
+        stable_since = None
         while time.time() < deadline and self.running:
-            try:
-                viewport = self.app.activeViewport
-                if viewport is not None:
-                    camera = viewport.camera
-                    offset = v_sub(
-                        (camera.eye.x, camera.eye.y, camera.eye.z),
-                        (camera.target.x, camera.target.y, camera.target.z),
-                    )
-                    if v_len(offset) > 1e-9:
+            state = self.camera_state()
+            if state is not None:
+                if state == last:
+                    if stable_since is None:
+                        stable_since = time.time()
+                    elif time.time() - stable_since >= settle:
                         return True
-            except Exception:
-                pass
-            time.sleep(1.0)
+                else:
+                    last = state
+                    stable_since = None
+            time.sleep(0.5)
         return False
 
     def selftest_loop(self):
         seconds = float(self.config.get("selftest_seconds", 3.0))
         timeout = float(self.config.get("selftest_wait_seconds", 600.0))
-        self.log.info("selftest: waiting up to %.0f s for an open design" % timeout)
-        if not self.wait_for_viewport(timeout):
+        settle = float(self.config.get("selftest_settle_seconds", 3.0))
+        self.log.info(
+            "selftest: waiting up to %.0f s for a design whose camera has been "
+            "still for %.1f s" % (timeout, settle)
+        )
+        if not self.wait_for_viewport(timeout, settle):
             self.log.warn("selftest: no viewport appeared, skipping")
             return
         camera = self.app.activeViewport.camera
@@ -490,8 +516,10 @@ class BifrostState(object):
             self.extra_yaw = 0.0
             buttons = self.buttons
             self.buttons = []
-            shots = self.shot_queue
-            self.shot_queue = []
+            shots = self.shot_queue[:1]
+            self.shot_queue = self.shot_queue[1:]
+            if self.shot_queue:
+                self.pending = True
 
         config = self.config
         mapping = config.get("map", {})

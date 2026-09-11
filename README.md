@@ -125,6 +125,10 @@ ever has to be edited.
 | `min_distance` | `0.01` | closest a perspective camera may dolly to its target |
 | `fit_button` | `"first"` | button number for fit, `"first"` learns it, `-1` disables |
 | `selftest` | `false` | run a scripted 360 degree orbit once a design is open |
+| `selftest_seconds` | `3.0` | how long that orbit takes |
+| `selftest_wait_seconds` | `600` | how long to wait for a design to appear |
+| `selftest_settle_seconds` | `3.0` | how long the camera must hold still first |
+| `selftest_image_dir` | `""` | where the rendered orbit frames go, empty means next to the log |
 | `log_path` | `""` | empty means Fusion's temp folder, see Troubleshooting |
 | `log_level` | `info` | `debug`, `info`, `warn`, `error` |
 
@@ -163,6 +167,14 @@ python3 tests/test_camera_math.py
 `tests/test_camera_math.py` stubs out `adsk.core` with a fake viewport, so the
 orbit, pan, zoom and fit logic can be checked on plain Linux before it ever
 reaches Fusion.
+
+Measured results for all of it, including what happens inside Fusion, are in
+[docs/TESTRESULTAT.md](docs/TESTRESULTAT.md) (Swedish).
+
+Setting `"selftest": true` makes the add-in drive a scripted 360 degree orbit
+as soon as a design is open, and render the viewport at 0, 90, 180, 270 and 360
+degrees to PNG files next to the log. That is the quickest way to prove the
+camera path works on a machine where taking a screenshot is awkward.
 
 ## Troubleshooting
 

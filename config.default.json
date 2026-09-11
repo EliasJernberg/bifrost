@@ -62,6 +62,7 @@
     "log_path": "",
     "log_level": "info",
     "selftest_wait_seconds": 600.0,
-    "selftest_image_dir": ""
+    "selftest_image_dir": "",
+    "selftest_settle_seconds": 3.0
   }
 }

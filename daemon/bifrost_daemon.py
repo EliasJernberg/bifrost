@@ -137,6 +137,7 @@ DEFAULTS = {
         "selftest_seconds": 3.0,
         "selftest_wait_seconds": 600.0,
         "selftest_image_dir": "",
+        "selftest_settle_seconds": 3.0,
         "log_path": "",
         "log_level": "info",
     },
