@@ -198,8 +198,10 @@ received, and the camera update rate once per second while you are moving.
 **The add-in never logs anything.** It is not loaded. Turn it on by hand under
 UTILITIES > ADD-INS, see above.
 
-**It drifts when I let go.** Raise `deadzone`. A SpaceMouse that has warmed up
-can sit at 10 to 20 counts off centre.
+**It drifts when I let go.** Raise `deadzone`. The puck on this machine sat at
+about 13 counts off centre on x while resting, and the default deadzone of 15 is
+only just above that. If the view creeps, 25 or 30 is a safe value: full
+deflection is around 350, so you lose very little range.
 
 **It is too fast or too slow.** `sensitivity` for everything at once,
 `orbit_speed`, `pan_speed` and `zoom_speed` for one motion at a time.
