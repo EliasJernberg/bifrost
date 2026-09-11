@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Exercise the add-in's camera maths outside Fusion.
+
+Bifrost.py imports adsk.core, which only exists inside Fusion, so this test
+installs a small stand-in first: Point3D, Vector3D, Point2D, CameraTypes,
+CustomEventHandler and an Application whose activeViewport hands out a fake
+orthographic camera. The add-in then runs against it unmodified, which lets the
+orbit, pan, zoom and fit logic be checked on plain Linux.
+
+    python3 tests/test_camera_math.py
+"""
+
+import math
+import os
+import sys
+import types
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+failures = []
+
+
+def check(condition, message):
+    print("  [%s] %s" % ("PASS" if condition else "FAIL", message))
+    if not condition:
+        failures.append(message)
+
+
+def close(a, b, tol=1e-6):
+    return abs(a - b) <= tol
+
+
+# -- the fake Fusion API ---------------------------------------------------
+
+
+class FakePoint3D(object):
+    def __init__(self, x, y, z):
+        self.x, self.y, self.z = x, y, z
+
+    @staticmethod
+    def create(x, y, z):
+        return FakePoint3D(x, y, z)
+
+
+class FakeVector3D(FakePoint3D):
+    @staticmethod
+    def create(x, y, z):
+        return FakeVector3D(x, y, z)
+
+
+class FakePoint2D(object):
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+
+    @staticmethod
+    def create(x, y):
+        return FakePoint2D(x, y)
+
+
+class FakeCameraTypes(object):
+    OrthographicCameraType = 0
+    PerspectiveCameraType = 1
+
+
+class FakeCamera(object):
+    def __init__(self):
+        self.eye = FakePoint3D(0.0, -100.0, 0.0)
+        self.target = FakePoint3D(0.0, 0.0, 0.0)
+        self.upVector = FakeVector3D(0.0, 0.0, 1.0)
+        self.viewExtents = 50.0
+        self.cameraType = FakeCameraTypes.OrthographicCameraType
+        self.isSmoothTransition = True
+
+
+class FakeViewport(object):
+    def __init__(self):
+        self._camera = FakeCamera()
+        self.width = 1600
+        self.height = 900
+        self.fit_calls = 0
+
+    @property
+    def camera(self):
+        copy = FakeCamera()
+        copy.eye = FakePoint3D(
+            self._camera.eye.x, self._camera.eye.y, self._camera.eye.z
+        )
+        copy.target = FakePoint3D(
+            self._camera.target.x, self._camera.target.y, self._camera.target.z
+        )
+        copy.upVector = FakeVector3D(
+            self._camera.upVector.x, self._camera.upVector.y, self._camera.upVector.z
+        )
+        copy.viewExtents = self._camera.viewExtents
+        copy.cameraType = self._camera.cameraType
+        return copy
+
+    @camera.setter
+    def camera(self, value):
+        self._camera = value
+
+    def viewToModelSpace(self, point2d):
+        """Pretend the view is 2 * sqrt(viewExtents) wide in world units."""
+        half = math.sqrt(self._camera.viewExtents)
+        frac = (point2d.x / float(self.width)) * 2.0 - 1.0
+        return FakePoint3D(frac * half, self._camera.target.y, self._camera.target.z)
+
+    def fit(self):
+        self.fit_calls += 1
+
+
+class FakeApplication(object):
+    _instance = None
+
+    def __init__(self):
+        self.activeViewport = FakeViewport()
+        self.fired = 0
+
+    @staticmethod
+    def get():
+        if FakeApplication._instance is None:
+            FakeApplication._instance = FakeApplication()
+        return FakeApplication._instance
+
+    def fireCustomEvent(self, event_id, info):
+        self.fired += 1
+
+    def registerCustomEvent(self, event_id):
+        return types.SimpleNamespace(add=lambda h: None, remove=lambda h: None)
+
+    def unregisterCustomEvent(self, event_id):
+        pass
+
+
+def install_fake_adsk():
+    core = types.ModuleType("adsk.core")
+    core.Point3D = FakePoint3D
+    core.Vector3D = FakeVector3D
+    core.Point2D = FakePoint2D
+    core.CameraTypes = FakeCameraTypes
+    core.Application = FakeApplication
+    core.CustomEventHandler = object
+    adsk = types.ModuleType("adsk")
+    adsk.core = core
+    sys.modules["adsk"] = adsk
+    sys.modules["adsk.core"] = core
+
+
+install_fake_adsk()
+sys.path.insert(0, os.path.join(REPO, "fusion_addin", "Bifrost"))
+import Bifrost  # noqa: E402
+
+
+# -- tests ------------------------------------------------------------------
+
+
+def test_vector_helpers():
+    print("vector helpers")
+    rotated = Bifrost.v_rotate((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), math.pi / 2.0)
+    check(
+        close(rotated[0], 0.0) and close(rotated[1], 1.0),
+        "90 degree rotation around Z maps +X to +Y",
+    )
+    back = Bifrost.v_rotate(rotated, (0.0, 0.0, 1.0), -math.pi / 2.0)
+    check(
+        close(back[0], 1.0) and close(back[1], 0.0),
+        "the inverse rotation gets back to the start",
+    )
+    check(
+        close(Bifrost.v_len(Bifrost.v_norm((3.0, 4.0, 0.0))), 1.0),
+        "v_norm returns a unit vector",
+    )
+    check(
+        Bifrost.v_norm((0.0, 0.0, 0.0)) == (0.0, 0.0, 0.0),
+        "v_norm survives the zero vector",
+    )
+
+
+def new_state():
+    """Fresh add-in state on a fresh viewport, so tests cannot leak into each other."""
+    Bifrost._state = None
+    FakeApplication._instance = None
+    state = Bifrost.BifrostState()
+    state.log.path = os.path.join(HERE, "fixtures", "addin_test.log")
+    state.apply_config(dict(Bifrost.DEFAULT_ADDIN_CONFIG))
+    return state
+
+
+def test_orbit_returns_home():
+    print("orbit")
+    state = new_state()
+    viewport = state.app.activeViewport
+    start = (viewport.camera.eye.x, viewport.camera.eye.y, viewport.camera.eye.z)
+    steps = 90
+    for _ in range(steps):
+        state.extra_yaw = (2.0 * math.pi) / steps
+        state.apply()
+    end = (viewport.camera.eye.x, viewport.camera.eye.y, viewport.camera.eye.z)
+    drift = Bifrost.v_len(Bifrost.v_sub(end, start))
+    check(
+        drift < 1e-6,
+        "a full 360 degree orbit returns to the start (drift %.2e cm)" % drift,
+    )
+    check(
+        state.camera_sets == steps,
+        "one camera update per step (%d)" % state.camera_sets,
+    )
+
+    # A quarter turn from -Y must land on -X or +X depending on direction.
+    state = new_state()
+    viewport = state.app.activeViewport
+    state.extra_yaw = math.pi / 2.0
+    state.apply()
+    eye = viewport.camera.eye
+    radius = math.sqrt(eye.x**2 + eye.y**2)
+    check(
+        close(radius, 100.0, 1e-6) and abs(eye.y) < 1e-6 and abs(eye.x) > 99.0,
+        "a quarter turn lands on the X axis at the same radius",
+    )
+    check(
+        close(viewport.camera.upVector.z, 1.0, 1e-6),
+        "world up is preserved through a turntable yaw",
+    )
+
+
+def test_pitch_limit():
+    print("pitch limit")
+    state = new_state()
+    viewport = state.app.activeViewport
+    for _ in range(200):
+        with state.lock:
+            state.acc[3] += 0.05  # rx drives pitch
+        state.apply()
+    eye = viewport.camera.eye
+    offset = Bifrost.v_norm((eye.x, eye.y, eye.z))
+    angle = math.degrees(math.acos(max(-1.0, min(1.0, offset[2]))))
+    check(
+        2.0 <= angle <= 178.0,
+        "turntable pitch never crosses the pole (%.1f degrees from world up)" % angle,
+    )
+    check(
+        close(Bifrost.v_len((eye.x, eye.y, eye.z)), 100.0, 1e-6),
+        "pitch keeps the orbit radius",
+    )
+
+
+def test_pan_and_zoom():
+    print("pan and zoom")
+    state = new_state()
+    viewport = state.app.activeViewport
+    before_target = viewport.camera.target.x
+    with state.lock:
+        state.acc[0] = 0.1  # x drives pan_x
+    state.apply()
+    after = viewport.camera
+    moved = abs(after.target.x - before_target)
+    check(moved > 0.0, "pan moves the target (%.3f cm)" % moved)
+    check(
+        close(after.target.x - before_target, after.eye.x - 0.0, 1e-9),
+        "pan moves eye and target by the same amount",
+    )
+    check(
+        close(after.eye.x - after.target.x, 0.0, 1e-6),
+        "pan keeps the view direction unchanged",
+    )
+
+    state = new_state()
+    viewport = state.app.activeViewport
+    extents_before = viewport.camera.viewExtents
+    with state.lock:
+        state.acc[2] = 0.5  # z drives dolly
+    state.apply()
+    extents_after = viewport.camera.viewExtents
+    expected = extents_before * math.exp(
+        -0.5 * Bifrost.DEFAULT_ADDIN_CONFIG["zoom_speed"]
+    )
+    check(
+        close(extents_after, expected, 1e-6),
+        "orthographic zoom scales viewExtents as exp(-dolly) (%.4f -> %.4f)"
+        % (extents_before, extents_after),
+    )
+    check(
+        close(
+            Bifrost.v_len(
+                (viewport.camera.eye.x, viewport.camera.eye.y, viewport.camera.eye.z)
+            ),
+            100.0,
+            1e-6,
+        ),
+        "orthographic zoom leaves the eye where it was",
+    )
+
+    # Perspective cameras dolly instead.
+    state = new_state()
+    viewport = state.app.activeViewport
+    viewport._camera.cameraType = FakeCameraTypes.PerspectiveCameraType
+    with state.lock:
+        state.acc[2] = 0.5
+    state.apply()
+    distance = Bifrost.v_len(
+        (viewport.camera.eye.x, viewport.camera.eye.y, viewport.camera.eye.z)
+    )
+    check(distance < 99.0, "perspective zoom moves the eye closer (%.2f cm)" % distance)
+
+
+def test_button_fit():
+    print("buttons")
+    state = new_state()
+    viewport = state.app.activeViewport
+    state.handle_line(b'{"t":"b","n":2,"p":1}')
+    check(state.fit_button == 2, "the first button seen becomes the fit button")
+    state.apply()
+    check(viewport.fit_calls == 1, "that button calls viewport.fit()")
+    state.handle_line(b'{"t":"b","n":5,"p":1}')
+    state.apply()
+    check(viewport.fit_calls == 1, "other buttons are ignored")
+
+
+def test_message_handling():
+    print("message handling")
+    state = new_state()
+    state.handle_line(b'{"t":"m","v":[1,0,0,0,0,0],"dt":0.5}')
+    state.handle_line(b'{"t":"m","v":[1,0,0,0,0,0],"dt":0.5}')
+    check(close(state.acc[0], 1.0), "motion frames integrate value times dt")
+    state.handle_line(b"not json at all")
+    check(close(state.acc[0], 1.0), "garbage lines are ignored")
+    state.handle_line(b'{"t":"hello","addin":{"orbit_speed":9.5}}')
+    check(state.config["orbit_speed"] == 9.5, "hello updates the config")
+    check(
+        state.config["pan_speed"] == Bifrost.DEFAULT_ADDIN_CONFIG["pan_speed"],
+        "hello keeps defaults for keys it does not mention",
+    )
+    state = new_state()
+    state.handle_line(b'{"t":"m","v":[0,0,0,0,0,0],"dt":0.0}')
+    check(all(v == 0.0 for v in state.acc), "a zero dt frame changes nothing")
+
+
+def test_idle_is_free():
+    print("idle")
+    state = new_state()
+    viewport = state.app.activeViewport
+    before = state.camera_sets
+    for _ in range(10):
+        state.apply()
+    check(state.camera_sets == before, "an empty accumulator never touches the camera")
+
+
+def main():
+    test_vector_helpers()
+    test_orbit_returns_home()
+    test_pitch_limit()
+    test_pan_and_zoom()
+    test_button_fit()
+    test_message_handling()
+    test_idle_is_free()
+    print()
+    if failures:
+        print("%d check(s) FAILED:" % len(failures))
+        for item in failures:
+            print("  - %s" % item)
+        return 1
+    print("all checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
