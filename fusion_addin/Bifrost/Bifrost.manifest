@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "addin",
+    "id": "bifrost-spacemouse-bridge",
+    "author": "Elias Jernberg",
+    "description": {
+        "": "SpaceMouse navigation for Fusion under Wine, fed by the Bifrost daemon over TCP."
+    },
+    "version": "1.0.0",
+    "runOnStartup": true,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
