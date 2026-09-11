@@ -53,6 +53,7 @@ DEFAULT_ADDIN_CONFIG = {
     "selftest": False,
     "selftest_seconds": 3.0,
     "selftest_wait_seconds": 600.0,
+    "selftest_image_dir": "",
     "log_path": "",
     "log_level": "info",
 }
@@ -184,6 +185,9 @@ class BifrostState(object):
         self.fit_button = None
         self.camera_sets = 0
         self.fires = 0
+        self.in_flight = False
+        self.fired_at = 0.0
+        self.shot_queue = []
         self._rate_window_start = time.time()
         self._rate_window_sets = 0
         self._logged_view_scale = False
@@ -302,19 +306,34 @@ class BifrostState(object):
     # -- pacing thread -------------------------------------------------
 
     def pacer_loop(self):
+        """Fire the custom event, but never faster than Fusion can drain it.
+
+        Fusion delivers custom events on its own main loop, and each camera
+        update forces a redraw. On a real assembly that settles somewhere around
+        10 Hz, well under max_fire_hz. Firing regardless would just pile up a
+        queue and add latency, so a new event only goes out once the previous
+        one has been handled. Nothing is lost either way: the handler drains the
+        whole accumulator, so a slower rate means bigger steps, not slower
+        motion.
+        """
         while self.running:
             hz = float(self.config.get("max_fire_hz", 30)) or 30.0
             period = 1.0 / hz
             fire = False
             with self.lock:
-                if self.pending or self.extra_yaw != 0.0:
+                busy = self.in_flight and (time.time() - self.fired_at) < 1.0
+                if (self.pending or self.extra_yaw != 0.0) and not busy:
                     self.pending = False
+                    self.in_flight = True
+                    self.fired_at = time.time()
                     fire = True
             if fire:
                 try:
                     self.app.fireCustomEvent(CUSTOM_EVENT_ID, "")
                     self.fires += 1
                 except Exception as exc:
+                    with self.lock:
+                        self.in_flight = False
                     self.log.error("fireCustomEvent failed: %s" % exc)
             time.sleep(period)
 
@@ -367,14 +386,29 @@ class BifrostState(object):
         self.log.info("selftest: scripted 360 degree orbit over %.1f s" % seconds)
         steps = max(1, int(seconds * 30))
         per_step = (2.0 * math.pi) / steps
+        shot_dir = self.config.get("selftest_image_dir") or os.path.dirname(
+            self.log.path
+        )
+        shot_at = dict(
+            (max(0, int(steps * fraction / 4.0) - 1), fraction)
+            for fraction in (1, 2, 3, 4)
+        )
+        self.request_shot(os.path.join(shot_dir, "bifrost-selftest-0deg.png"))
         start = time.time()
         sets_before = self.camera_sets
-        for _ in range(steps):
+        for index in range(steps):
             if not self.running:
                 return
             with self.lock:
                 self.extra_yaw += per_step
                 self.pending = True
+            if index in shot_at:
+                self.request_shot(
+                    os.path.join(
+                        shot_dir,
+                        "bifrost-selftest-%ddeg.png" % (shot_at[index] * 90),
+                    )
+                )
             time.sleep(seconds / steps)
         time.sleep(0.5)
         elapsed = time.time() - start
@@ -430,6 +464,24 @@ class BifrostState(object):
             self.log.debug("viewToModelSpace unavailable (%s), using distance" % exc)
         return max(distance, 1e-6)
 
+    def request_shot(self, path):
+        """Ask the main thread to render the viewport to a file.
+
+        Used by the self test. Saving has to happen on Fusion's own thread, so
+        the request is queued and picked up by the next apply().
+        """
+        with self.lock:
+            self.shot_queue.append(path)
+            self.pending = True
+
+    def take_shots(self, viewport, shots):
+        for path in shots:
+            try:
+                ok = viewport.saveAsImageFile(path, 1200, 800)
+                self.log.info("selftest: saved %s (%s)" % (path, ok))
+            except Exception as exc:
+                self.log.warn("selftest: could not save %s: %s" % (path, exc))
+
     def apply(self):
         with self.lock:
             acc = self.acc
@@ -438,6 +490,8 @@ class BifrostState(object):
             self.extra_yaw = 0.0
             buttons = self.buttons
             self.buttons = []
+            shots = self.shot_queue
+            self.shot_queue = []
 
         config = self.config
         mapping = config.get("map", {})
@@ -465,7 +519,7 @@ class BifrostState(object):
         dolly = pick("dolly") * zoom_speed
 
         moved = any(abs(v) > 1e-9 for v in (yaw, pitch, roll, pan_x, pan_y, dolly))
-        if not moved and not buttons:
+        if not moved and not buttons and not shots:
             return
 
         try:
@@ -486,6 +540,7 @@ class BifrostState(object):
                 elif pressed:
                     self.log.debug("button %d pressed, unmapped" % bnum)
         if not moved:
+            self.take_shots(viewport, shots)
             return
 
         camera = viewport.camera
@@ -586,13 +641,26 @@ class BifrostState(object):
             self.log.warn("camera update rejected: %s" % exc)
             return
 
+        self.take_shots(viewport, shots)
+
         now = time.time()
         if now - self._rate_window_start >= 1.0:
             elapsed = now - self._rate_window_start
-            self.log.info(
-                "camera update rate: %.1f Hz (%d sets in %.2f s)"
-                % (self._rate_window_sets / elapsed, self._rate_window_sets, elapsed)
-            )
+            if self._rate_window_sets >= 3:
+                self.log.info(
+                    "camera update rate: %.1f Hz (%d sets in %.2f s), "
+                    "eye=(%.3f, %.3f, %.3f) dist=%.3f extents=%.4f"
+                    % (
+                        self._rate_window_sets / elapsed,
+                        self._rate_window_sets,
+                        elapsed,
+                        eye[0],
+                        eye[1],
+                        eye[2],
+                        v_len(v_sub(eye, target)),
+                        camera.viewExtents,
+                    )
+                )
             self._rate_window_start = now
             self._rate_window_sets = 0
 
@@ -609,6 +677,10 @@ class BifrostEventHandler(adsk.core.CustomEventHandler):
             state.apply()
         except Exception:
             state.log.error("apply() blew up:\n%s" % traceback.format_exc())
+        finally:
+            # Let the pacer send the next one now that this one is done.
+            with state.lock:
+                state.in_flight = False
 
 
 def run(context):

@@ -72,6 +72,17 @@ def main():
     with open(out_path, "wb") as handle:
         handle.write(blob)
     print("%s: %d bytes, %d frames" % (out_path, len(blob), len(blob) // 32))
+
+    # A second fixture for watching Fusion itself move: six seconds of steady
+    # yaw, then centre. Long enough to see several full turns on screen.
+    steady_path = os.path.join(out_dir, "steady_yaw.bin")
+    steady = b""
+    for _ in range(int(6.0 * 1000 / PERIOD_MS)):
+        steady += motion(ry=300)
+    steady += motion()
+    with open(steady_path, "wb") as handle:
+        handle.write(steady)
+    print("%s: %d bytes, %d frames" % (steady_path, len(steady), len(steady) // 32))
     return 0
 
 

@@ -125,7 +125,7 @@ ever has to be edited.
 | `min_distance` | `0.01` | closest a perspective camera may dolly to its target |
 | `fit_button` | `"first"` | button number for fit, `"first"` learns it, `-1` disables |
 | `selftest` | `false` | run a scripted 360 degree orbit once a design is open |
-| `log_path` | `""` | empty means `C:\users\<you>\Temp\bifrost.log` |
+| `log_path` | `""` | empty means Fusion's temp folder, see Troubleshooting |
 | `log_level` | `info` | `debug`, `info`, `warn`, `error` |
 
 Default axis map:
@@ -172,8 +172,12 @@ reaches Fusion.
 systemctl --user status bifrost.service          # daemon alive?
 ./daemon/bifrost_daemon.py --dump --seconds 5    # does spacenavd see the puck?
 ./daemon/bifrost_daemon.py --tail --seconds 5    # does the daemon serve frames?
-tail -f ~/.autodesk_fusion/wineprefixes/default/drive_c/users/$USER/Temp/bifrost.log
+tail -f ~/.autodesk_fusion/wineprefixes/default/drive_c/users/$USER/AppData/Local/Temp/bifrost.log
 ```
+
+That last path is where Fusion's embedded Python puts its temp files. If yours
+differs, `find ~/.autodesk_fusion -name bifrost.log` will find it, or set
+`log_path` in the config to somewhere you pick.
 
 The add-in log is a plain file on the Linux side, so it can be tailed while
 Fusion runs. It records startup, every connect and disconnect, the config it
