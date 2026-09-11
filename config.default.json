@@ -1,0 +1,66 @@
+{
+  "daemon": {
+    "spnav_socket": "/run/spnav.sock",
+    "listen_host": "127.0.0.1",
+    "listen_port": 47653,
+    "emit_hz": 60,
+    "ping_seconds": 5.0,
+    "deadzone": 15,
+    "full_scale": 350,
+    "sensitivity": 1.0,
+    "axis_gain": {
+      "x": 1.0,
+      "y": 1.0,
+      "z": 1.0,
+      "rx": 1.0,
+      "ry": 1.0,
+      "rz": 1.0
+    },
+    "axis_invert": {
+      "x": false,
+      "y": false,
+      "z": false,
+      "rx": false,
+      "ry": false,
+      "rz": false
+    },
+    "verbose": false
+  },
+  "addin": {
+    "max_fire_hz": 30,
+    "map": {
+      "pan_x": "x",
+      "pan_y": "y",
+      "dolly": "z",
+      "pitch": "rx",
+      "yaw": "ry",
+      "roll": "rz"
+    },
+    "invert": {
+      "pan_x": false,
+      "pan_y": true,
+      "dolly": false,
+      "pitch": false,
+      "yaw": false,
+      "roll": false
+    },
+    "orbit_speed": 2.5,
+    "pan_speed": 1.0,
+    "zoom_speed": 1.2,
+    "roll_speed": 0.0,
+    "orbit_mode": "turntable",
+    "world_up": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "pitch_limit_deg": 2.0,
+    "min_distance": 0.01,
+    "fit_button": "first",
+    "selftest": false,
+    "selftest_seconds": 3.0,
+    "log_path": "",
+    "log_level": "info",
+    "selftest_wait_seconds": 600.0
+  }
+}
