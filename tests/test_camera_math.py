@@ -13,6 +13,7 @@ orbit, pan, zoom and fit logic be checked on plain Linux.
 import math
 import os
 import sys
+import time
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +30,11 @@ def check(condition, message):
 
 def close(a, b, tol=1e-6):
     return abs(a - b) <= tol
+
+
+def axis_of(motion):
+    """Index into acc[] for whatever raw axis the default map gives a motion."""
+    return Bifrost.AXES.index(Bifrost.DEFAULT_ADDIN_CONFIG["map"][motion])
 
 
 # -- the fake Fusion API ---------------------------------------------------
@@ -110,11 +116,30 @@ class FakeViewport(object):
         self.fit_calls += 1
 
 
+class FakeBoundingBox(object):
+    def __init__(self, low, high):
+        self.minPoint = FakePoint3D(*low)
+        self.maxPoint = FakePoint3D(*high)
+
+
+class FakeComponent(object):
+    def __init__(self, box):
+        self.boundingBox = box
+
+
+class FakeProduct(object):
+    """Stand-in for adsk.fusion.Design, which is what activeProduct returns."""
+
+    def __init__(self, box):
+        self.rootComponent = FakeComponent(box)
+
+
 class FakeApplication(object):
     _instance = None
 
     def __init__(self):
         self.activeViewport = FakeViewport()
+        self.activeProduct = None
         self.fired = 0
 
     @staticmethod
@@ -230,7 +255,7 @@ def test_pitch_limit():
     viewport = state.app.activeViewport
     for _ in range(200):
         with state.lock:
-            state.acc[3] += 0.05  # rx drives pitch
+            state.acc[axis_of("pitch")] += 0.05
         state.apply()
     eye = viewport.camera.eye
     offset = Bifrost.v_norm((eye.x, eye.y, eye.z))
@@ -251,7 +276,7 @@ def test_pan_and_zoom():
     viewport = state.app.activeViewport
     before_target = viewport.camera.target.x
     with state.lock:
-        state.acc[0] = 0.1  # x drives pan_x
+        state.acc[axis_of("pan_x")] = 0.1
     state.apply()
     after = viewport.camera
     moved = abs(after.target.x - before_target)
@@ -268,8 +293,9 @@ def test_pan_and_zoom():
     state = new_state()
     viewport = state.app.activeViewport
     extents_before = viewport.camera.viewExtents
+    dolly_in = 0.5 if not Bifrost.DEFAULT_ADDIN_CONFIG["invert"]["dolly"] else -0.5
     with state.lock:
-        state.acc[2] = 0.5  # z drives dolly
+        state.acc[axis_of("dolly")] = dolly_in
     state.apply()
     extents_after = viewport.camera.viewExtents
     expected = extents_before * math.exp(
@@ -296,7 +322,7 @@ def test_pan_and_zoom():
     viewport = state.app.activeViewport
     viewport._camera.cameraType = FakeCameraTypes.PerspectiveCameraType
     with state.lock:
-        state.acc[2] = 0.5
+        state.acc[axis_of("dolly")] = dolly_in
     state.apply()
     distance = Bifrost.v_len(
         (viewport.camera.eye.x, viewport.camera.eye.y, viewport.camera.eye.z)
@@ -336,6 +362,142 @@ def test_message_handling():
     check(all(v == 0.0 for v in state.acc), "a zero dt frame changes nothing")
 
 
+def test_orbit_pivot():
+    print("orbit pivot")
+    # The model sits well off the camera target: centre (20, 20, 5).
+    state = new_state()
+    state.app.activeProduct = FakeProduct(FakeBoundingBox((10, 10, 0), (30, 30, 10)))
+    viewport = state.app.activeViewport
+    state.config["orbit_pivot"] = "target"
+    state.extra_yaw = math.pi / 2.0
+    state.apply()
+    check(
+        close(viewport.camera.target.x, 0.0, 1e-9)
+        and close(viewport.camera.target.y, 0.0, 1e-9),
+        "pivot=target leaves the target where it was",
+    )
+
+    state = new_state()
+    state.app.activeProduct = FakeProduct(FakeBoundingBox((10, 10, 0), (30, 30, 10)))
+    viewport = state.app.activeViewport
+    state.config["orbit_pivot"] = "auto"
+    state.extra_yaw = math.pi / 2.0
+    state.apply()
+    eye = viewport.camera.eye
+    target = viewport.camera.target
+    check(
+        state.pivot_valid and state.pivot_source == "model",
+        "auto picks the model centre as pivot (%s)" % (state.pivot,),
+    )
+    check(
+        close(state.pivot[0], 20.0) and close(state.pivot[1], 20.0),
+        "the pivot is the bounding box centre",
+    )
+    # eye (0,-100,0) and target (0,0,0) both turn 90 degrees around (20,20,5).
+    check(
+        close(eye.x, 140.0, 1e-6) and close(eye.y, 0.0, 1e-6),
+        "the eye turns around the model, not the target (%.3f, %.3f)" % (eye.x, eye.y),
+    )
+    check(
+        close(target.x, 40.0, 1e-6) and close(target.y, 0.0, 1e-6),
+        "the target travels with it (%.3f, %.3f)" % (target.x, target.y),
+    )
+    check(
+        close(
+            Bifrost.v_len(
+                Bifrost.v_sub((eye.x, eye.y, eye.z), (target.x, target.y, target.z))
+            ),
+            100.0,
+            1e-6,
+        ),
+        "the eye to target distance survives a pivot orbit",
+    )
+
+    # A model centred on the target must behave exactly like the old code.
+    state = new_state()
+    state.app.activeProduct = FakeProduct(FakeBoundingBox((-5, -5, -5), (5, 5, 5)))
+    viewport = state.app.activeViewport
+    state.extra_yaw = math.pi / 2.0
+    state.apply()
+    check(
+        close(viewport.camera.target.x, 0.0, 1e-6)
+        and close(viewport.camera.eye.x, 100.0, 1e-6),
+        "a centred model gives the same orbit as pivot=target",
+    )
+
+    # No design open: fall back to the target instead of blowing up.
+    state = new_state()
+    state.app.activeProduct = None
+    viewport = state.app.activeViewport
+    state.extra_yaw = math.pi / 2.0
+    state.apply()
+    check(
+        state.pivot_source == "target" and close(viewport.camera.target.x, 0.0, 1e-6),
+        "no design open falls back to the target",
+    )
+
+    # Pan drags the pivot along, so the next orbit still turns around the same
+    # point of the model.
+    state = new_state()
+    state.app.activeProduct = FakeProduct(FakeBoundingBox((10, 10, 0), (30, 30, 10)))
+    state.extra_yaw = 0.01
+    state.apply()
+    before = state.pivot
+    with state.lock:
+        state.acc[axis_of("pan_x")] = 0.1
+    state.apply()
+    moved = Bifrost.v_len(Bifrost.v_sub(state.pivot, before))
+    check(moved > 1e-6, "panning moves the pivot with the view (%.3f cm)" % moved)
+
+
+def test_bursts():
+    print("bursts")
+    state = new_state()
+    log_path = os.path.join(HERE, "fixtures", "addin_burst_test.log")
+    if os.path.exists(log_path):
+        os.remove(log_path)
+    state.log.path = log_path
+    state.log.set_level("debug")
+    with state.lock:
+        state.acc[axis_of("yaw")] = 0.1
+    state.apply()
+    check(state.burst_open, "motion opens a burst")
+    with state.lock:
+        state.acc[axis_of("yaw")] = 0.1
+    state.apply()
+    check(
+        close(state.burst_input[axis_of("yaw")], 0.2),
+        "the burst sums the input it saw (%.3f)" % state.burst_input[axis_of("yaw")],
+    )
+    sets_before = state.camera_sets
+    with state.lock:
+        state.close_burst_requested = True
+    state.apply()
+    check(
+        not state.burst_open and state.camera_sets == sets_before,
+        "closing a burst reads the camera without moving it",
+    )
+    text = open(log_path).read()
+    check("burst start" in text, "the burst start line is logged")
+    check("burst end" in text, "the burst end line is logged")
+    check(
+        "%s=+0.2000" % Bifrost.DEFAULT_ADDIN_CONFIG["map"]["yaw"] in text,
+        "the end line carries the integrated input",
+    )
+    check("d_eye=" in text, "the end line carries the camera delta")
+
+    # A gap longer than idle_gap_seconds starts a new burst.
+    state.last_motion_at = time.time() - 5.0
+    state.burst_open = True
+    with state.lock:
+        state.acc[axis_of("yaw")] = 0.1
+    state.apply()
+    check(
+        close(state.burst_input[axis_of("yaw")], 0.1),
+        "a gap resets the burst integral (%.3f)" % state.burst_input[axis_of("yaw")],
+    )
+
+
 def test_idle_is_free():
     print("idle")
     state = new_state()
@@ -351,6 +513,8 @@ def main():
     test_orbit_returns_home()
     test_pitch_limit()
     test_pan_and_zoom()
+    test_orbit_pivot()
+    test_bursts()
     test_button_fit()
     test_message_handling()
     test_idle_is_free()

@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 tests/fixtures/test_config.json
 tests/fixtures/addin_test.log
+tests/fixtures/addin_burst_test.log

@@ -27,18 +27,18 @@ DEFAULT_ADDIN_CONFIG = {
     "max_fire_hz": 30,
     "map": {
         "pan_x": "x",
-        "pan_y": "y",
-        "dolly": "z",
+        "pan_y": "z",
+        "dolly": "y",
         "pitch": "rx",
         "yaw": "ry",
         "roll": "rz",
     },
     "invert": {
         "pan_x": False,
-        "pan_y": True,
-        "dolly": False,
+        "pan_y": False,
+        "dolly": True,
         "pitch": False,
-        "yaw": False,
+        "yaw": True,
         "roll": False,
     },
     "orbit_speed": 2.5,
@@ -46,12 +46,15 @@ DEFAULT_ADDIN_CONFIG = {
     "zoom_speed": 1.2,
     "roll_speed": 0.0,
     "orbit_mode": "turntable",
+    "orbit_pivot": "auto",
+    "idle_gap_seconds": 0.5,
     "world_up": [0.0, 0.0, 1.0],
     "pitch_limit_deg": 2.0,
     "min_distance": 0.01,
     "fit_button": "first",
     "selftest": False,
     "selftest_seconds": 3.0,
+    "selftest_pan": 0.0,
     "selftest_wait_seconds": 600.0,
     "selftest_image_dir": "",
     "selftest_settle_seconds": 3.0,
@@ -179,6 +182,22 @@ class BifrostState(object):
         self.buttons = []  # pending (bnum, pressed)
         self.pending = False
 
+        # A burst is one continuous movement: it opens on the first input after
+        # a quiet gap and closes once the puck has been still for
+        # idle_gap_seconds. The pivot is chosen once per burst, and the debug
+        # log gets one before line and one after line per burst, which is what
+        # makes the axis matrix measurable.
+        self.burst_open = False
+        self.burst_started_at = 0.0
+        self.last_motion_at = 0.0
+        self.burst_input = [0.0] * 6
+        self.burst_start_cam = None
+        self.close_burst_requested = False
+
+        self.pivot = None
+        self.pivot_valid = False
+        self.pivot_source = "target"
+
         self.custom_event = None
         self.handler = None
         self.threads = []
@@ -218,13 +237,15 @@ class BifrostState(object):
         else:
             self.fit_button = -1
         self.log.info(
-            "config applied: orbit=%s pan=%s zoom=%s mode=%s map=%s"
+            "config applied: orbit=%s pan=%s zoom=%s mode=%s pivot=%s map=%s invert=%s"
             % (
                 merged.get("orbit_speed"),
                 merged.get("pan_speed"),
                 merged.get("zoom_speed"),
                 merged.get("orbit_mode"),
+                merged.get("orbit_pivot"),
                 merged.get("map"),
+                merged.get("invert"),
             )
         )
 
@@ -320,8 +341,19 @@ class BifrostState(object):
         while self.running:
             hz = float(self.config.get("max_fire_hz", 30)) or 30.0
             period = 1.0 / hz
+            idle_gap = float(self.config.get("idle_gap_seconds", 0.5))
             fire = False
             with self.lock:
+                # A burst that has gone quiet needs one more trip through the
+                # main thread to read the camera it ended on.
+                if (
+                    self.burst_open
+                    and not self.pending
+                    and not self.close_burst_requested
+                    and (time.time() - self.last_motion_at) >= idle_gap
+                ):
+                    self.close_burst_requested = True
+                    self.pending = True
                 busy = self.in_flight and (time.time() - self.fired_at) < 1.0
                 if (self.pending or self.extra_yaw != 0.0) and not busy:
                     self.pending = False
@@ -409,6 +441,37 @@ class BifrostState(object):
                 camera.cameraType == adsk.core.CameraTypes.OrthographicCameraType,
             )
         )
+        pan = float(self.config.get("selftest_pan", 0.0))
+        if abs(pan) > 1e-9:
+            # Shove the model off to one side first. With orbit_pivot "auto" the
+            # orbit that follows still has to turn around the model, which is
+            # exactly what the rendered frames are there to show.
+            axis = self.config.get("map", {}).get("pan_x")
+            index = AXES.index(axis) if axis in AXES else 0
+            speed = float(self.config.get("pan_speed", 1.0)) or 1.0
+            amount = pan / speed
+            if self.config.get("invert", {}).get("pan_x", False):
+                amount = -amount
+            self.log.info("selftest: panning %.2f viewport widths first" % pan)
+            for _ in range(20):
+                with self.lock:
+                    self.acc[index] += amount / 20.0
+                    self.pending = True
+                time.sleep(0.05)
+            time.sleep(1.0)
+            camera = self.app.activeViewport.camera
+            self.log.info(
+                "selftest: after pan eye=(%.3f, %.3f, %.3f) target=(%.3f, %.3f, %.3f)"
+                % (
+                    camera.eye.x,
+                    camera.eye.y,
+                    camera.eye.z,
+                    camera.target.x,
+                    camera.target.y,
+                    camera.target.z,
+                )
+            )
+
         self.log.info("selftest: scripted 360 degree orbit over %.1f s" % seconds)
         steps = max(1, int(seconds * 30))
         per_step = (2.0 * math.pi) / steps
@@ -508,6 +571,185 @@ class BifrostState(object):
             except Exception as exc:
                 self.log.warn("selftest: could not save %s: %s" % (path, exc))
 
+    # -- pivot ---------------------------------------------------------
+
+    @staticmethod
+    def box_centre(box):
+        """Centre of an adsk BoundingBox3D, or None if it is unusable."""
+        try:
+            low = box.minPoint
+            high = box.maxPoint
+            centre = (
+                (low.x + high.x) / 2.0,
+                (low.y + high.y) / 2.0,
+                (low.z + high.z) / 2.0,
+            )
+        except Exception:
+            return None
+        for value in centre:
+            if value != value or abs(value) > 1e12:  # NaN or nonsense
+                return None
+        return centre
+
+    def occurrence_centre(self, root):
+        """Fallback centre: union the boxes of what is visible in the root.
+
+        Component.boundingBox is one native call and covers the whole assembly,
+        so it is tried first. This walk only runs when that call is missing or
+        returns nothing, for instance in a design that holds only sketches.
+        """
+        low = None
+        high = None
+        count = 0
+        for collection_name in ("bRepBodies", "meshBodies", "occurrences"):
+            try:
+                collection = getattr(root, collection_name)
+            except Exception:
+                continue
+            try:
+                total = collection.count
+            except Exception:
+                continue
+            for index in range(min(total, 500)):
+                try:
+                    item = collection.item(index)
+                    if hasattr(item, "isVisible") and not item.isVisible:
+                        continue
+                    if hasattr(item, "isLightBulbOn") and not item.isLightBulbOn:
+                        continue
+                    box = item.boundingBox
+                    if box is None:
+                        continue
+                    mins = (box.minPoint.x, box.minPoint.y, box.minPoint.z)
+                    maxs = (box.maxPoint.x, box.maxPoint.y, box.maxPoint.z)
+                except Exception:
+                    continue
+                count += 1
+                if low is None:
+                    low, high = list(mins), list(maxs)
+                else:
+                    for axis in range(3):
+                        low[axis] = min(low[axis], mins[axis])
+                        high[axis] = max(high[axis], maxs[axis])
+        if low is None:
+            return None
+        self.log.debug("pivot: unioned %d visible items" % count)
+        return tuple((low[axis] + high[axis]) / 2.0 for axis in range(3))
+
+    def model_centre(self):
+        """Centre of the visible model's bounding box, in world coordinates.
+
+        None when no design is open, when it holds nothing visible, or when the
+        API refuses the call. The caller then falls back to the camera target,
+        which is what every version before orbit_pivot did.
+        """
+        try:
+            product = self.app.activeProduct
+        except Exception as exc:
+            self.log.debug("pivot: activeProduct unavailable (%s)" % exc)
+            return None
+        if product is None:
+            self.log.debug("pivot: no active product, using target")
+            return None
+        root = None
+        try:
+            root = product.rootComponent
+        except Exception as exc:
+            self.log.debug("pivot: no rootComponent (%s), using target" % exc)
+            return None
+        if root is None:
+            return None
+        started = time.time()
+        centre = None
+        try:
+            centre = self.box_centre(root.boundingBox)
+        except Exception as exc:
+            self.log.debug("pivot: rootComponent.boundingBox failed (%s)" % exc)
+        if centre is None:
+            centre = self.occurrence_centre(root)
+        if centre is None:
+            self.log.debug("pivot: nothing visible to centre on, using target")
+            return None
+        self.log.debug(
+            "pivot: model centre (%.3f, %.3f, %.3f) in %.0f ms"
+            % (centre[0], centre[1], centre[2], (time.time() - started) * 1000.0)
+        )
+        return centre
+
+    def resolve_pivot(self, target):
+        """Pivot for this burst's orbit. Computed once, then reused."""
+        if self.config.get("orbit_pivot", "auto") != "auto":
+            return target, "target"
+        if not self.pivot_valid:
+            centre = self.model_centre()
+            if centre is None:
+                self.pivot = target
+                self.pivot_source = "target"
+            else:
+                self.pivot = centre
+                self.pivot_source = "model"
+            self.pivot_valid = True
+        return self.pivot, self.pivot_source
+
+    # -- bursts --------------------------------------------------------
+
+    @staticmethod
+    def fmt_vec(vector):
+        return "(%.3f, %.3f, %.3f)" % (vector[0], vector[1], vector[2])
+
+    def open_burst(self, eye, target, up, extents, is_ortho):
+        self.burst_start_cam = (eye, target, up, extents)
+        self.pivot_valid = False
+        self.log.debug(
+            "burst start eye=%s target=%s up=%s dist=%.4f extents=%.4f ortho=%s"
+            % (
+                self.fmt_vec(eye),
+                self.fmt_vec(target),
+                self.fmt_vec(up),
+                v_len(v_sub(eye, target)),
+                extents,
+                is_ortho,
+            )
+        )
+
+    def close_burst(self, viewport):
+        """Log where the camera ended up, once the puck has gone still."""
+        start = self.burst_start_cam
+        self.burst_open = False
+        self.burst_start_cam = None
+        with self.lock:
+            burst_input = list(self.burst_input)
+            self.burst_input = [0.0] * 6
+        if start is None:
+            return
+        try:
+            camera = viewport.camera
+            eye = (camera.eye.x, camera.eye.y, camera.eye.z)
+            target = (camera.target.x, camera.target.y, camera.target.z)
+            up = (camera.upVector.x, camera.upVector.y, camera.upVector.z)
+            extents = camera.viewExtents
+        except Exception as exc:
+            self.log.debug("burst end: camera unreadable (%s)" % exc)
+            return
+        self.log.debug(
+            "burst end   eye=%s target=%s up=%s dist=%.4f extents=%.4f "
+            "input=[%s] d_eye=%s d_target=%s d_dist=%+.4f d_extents=%+.4f "
+            "pivot=%s"
+            % (
+                self.fmt_vec(eye),
+                self.fmt_vec(target),
+                self.fmt_vec(up),
+                v_len(v_sub(eye, target)),
+                extents,
+                ", ".join("%s=%+.4f" % (AXES[i], burst_input[i]) for i in range(6)),
+                self.fmt_vec(v_sub(eye, start[0])),
+                self.fmt_vec(v_sub(target, start[1])),
+                v_len(v_sub(eye, target)) - v_len(v_sub(start[0], start[1])),
+                extents - start[3],
+                self.pivot_source if self.pivot_valid else "none",
+            )
+        )
+
     def apply(self):
         with self.lock:
             acc = self.acc
@@ -520,6 +762,8 @@ class BifrostState(object):
             self.shot_queue = self.shot_queue[1:]
             if self.shot_queue:
                 self.pending = True
+            closing = self.close_burst_requested
+            self.close_burst_requested = False
 
         config = self.config
         mapping = config.get("map", {})
@@ -547,15 +791,22 @@ class BifrostState(object):
         dolly = pick("dolly") * zoom_speed
 
         moved = any(abs(v) > 1e-9 for v in (yaw, pitch, roll, pan_x, pan_y, dolly))
-        if not moved and not buttons and not shots:
+        if not moved and not buttons and not shots and not closing:
             return
 
         try:
             viewport = self.app.activeViewport
         except Exception:
-            return
+            viewport = None
         if viewport is None:
+            # No document, so nothing to read the burst off. Close it anyway,
+            # or the pacer keeps asking for a camera that is not there.
+            self.burst_open = False
+            self.burst_start_cam = None
             return
+
+        if closing and not moved:
+            self.close_burst(viewport)
 
         if buttons:
             for bnum, pressed in buttons:
@@ -581,6 +832,28 @@ class BifrostState(object):
         if distance < 1e-9:
             return
 
+        is_ortho = False
+        try:
+            is_ortho = camera.cameraType == adsk.core.CameraTypes.OrthographicCameraType
+        except Exception:
+            pass
+
+        # Burst bookkeeping. The first input after a quiet gap opens a burst,
+        # which is also when the orbit pivot is allowed to move.
+        now = time.time()
+        idle_gap = float(config.get("idle_gap_seconds", 0.5))
+        with self.lock:
+            fresh = (not self.burst_open) or (now - self.last_motion_at) >= idle_gap
+            self.last_motion_at = now
+            self.burst_open = True
+            if fresh:
+                self.burst_input = [0.0] * 6
+                self.burst_started_at = now
+            for index in range(6):
+                self.burst_input[index] += acc[index]
+        if fresh:
+            self.open_burst(eye, target, up, camera.viewExtents, is_ortho)
+
         forward = v_norm(v_scale(offset, -1.0))
         right = v_norm(v_cross(forward, up))
         if right == (0.0, 0.0, 0.0):
@@ -589,20 +862,37 @@ class BifrostState(object):
 
         # Orbit. Pitch always turns around the camera's right vector. Yaw turns
         # around the world up axis in turntable mode, around the camera up
-        # vector in free mode.
+        # vector in free mode. Both turn eye and target around the pivot, which
+        # is the camera target in "target" mode and the centre of the model in
+        # "auto" mode, so the model stays put even when it sits off target.
+        pivot = target
+        if abs(yaw) > 1e-9 or abs(pitch) > 1e-9:
+            pivot, _source = self.resolve_pivot(target)
+        eye_off = v_sub(eye, pivot)
+        target_off = v_sub(target, pivot)
+
         if abs(pitch) > 1e-9:
-            new_offset = v_rotate(offset, right, pitch)
+            new_eye_off = v_rotate(eye_off, right, pitch)
+            new_target_off = v_rotate(target_off, right, pitch)
             new_up = v_rotate(up, right, pitch)
             if config.get("orbit_mode", "turntable") == "turntable":
                 world_up = v_norm(tuple(config.get("world_up", [0.0, 0.0, 1.0])))
                 limit = math.radians(float(config.get("pitch_limit_deg", 2.0)))
                 angle = math.acos(
-                    max(-1.0, min(1.0, v_dot(v_norm(new_offset), world_up)))
+                    max(
+                        -1.0,
+                        min(
+                            1.0,
+                            v_dot(v_norm(v_sub(new_eye_off, new_target_off)), world_up),
+                        ),
+                    )
                 )
                 if angle < limit or angle > math.pi - limit:
-                    new_offset = offset
+                    new_eye_off = eye_off
+                    new_target_off = target_off
                     new_up = up
-            offset = new_offset
+            eye_off = new_eye_off
+            target_off = new_target_off
             up = new_up
 
         if abs(yaw) > 1e-9:
@@ -610,8 +900,13 @@ class BifrostState(object):
                 yaw_axis = v_norm(tuple(config.get("world_up", [0.0, 0.0, 1.0])))
             else:
                 yaw_axis = up
-            offset = v_rotate(offset, yaw_axis, yaw)
+            eye_off = v_rotate(eye_off, yaw_axis, yaw)
+            target_off = v_rotate(target_off, yaw_axis, yaw)
             up = v_rotate(up, yaw_axis, yaw)
+
+        eye = v_add(pivot, eye_off)
+        target = v_add(pivot, target_off)
+        offset = v_sub(eye, target)
 
         if abs(roll) > 1e-9:
             forward = v_norm(v_scale(offset, -1.0))
@@ -621,12 +916,6 @@ class BifrostState(object):
         right = v_norm(v_cross(forward, up))
         up = v_norm(v_cross(right, forward))
         distance = v_len(offset)
-
-        is_ortho = False
-        try:
-            is_ortho = camera.cameraType == adsk.core.CameraTypes.OrthographicCameraType
-        except Exception:
-            pass
 
         scale = self.view_scale(viewport, camera, distance)
 
@@ -651,11 +940,16 @@ class BifrostState(object):
         eye = v_add(target, offset)
 
         # Pan. Both eye and target slide along the camera plane, scaled by how
-        # much world the viewport currently shows.
+        # much world the viewport currently shows. The camera moves against the
+        # input, which is what makes the model follow the puck on screen. An
+        # auto pivot rides along, so orbiting after a pan still turns around the
+        # same point of the model.
         if abs(pan_x) > 1e-9 or abs(pan_y) > 1e-9:
             delta = v_add(v_scale(right, -pan_x * scale), v_scale(up, -pan_y * scale))
             eye = v_add(eye, delta)
             target = v_add(target, delta)
+            if self.pivot_valid and self.pivot is not None:
+                self.pivot = v_add(self.pivot, delta)
 
         try:
             camera.eye = adsk.core.Point3D.create(eye[0], eye[1], eye[2])
