@@ -7,17 +7,25 @@ CustomEventHandler and an Application whose activeViewport hands out a fake
 orthographic camera. The add-in then runs against it unmodified, which lets the
 orbit, pan, zoom and fit logic be checked on plain Linux.
 
+The cross talk test goes one step further and pulls in the daemon's shaping, so
+it runs raw spacenavd counts through the whole chain, exactly as the hardware
+does: counts in, camera out.
+
     python3 tests/test_camera_math.py
 """
 
 import math
 import os
+import random
 import sys
 import time
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+
+sys.path.insert(0, os.path.join(REPO, "daemon"))
+import bifrost_daemon  # noqa: E402
 
 failures = []
 
@@ -30,6 +38,9 @@ def check(condition, message):
 
 def close(a, b, tol=1e-6):
     return abs(a - b) <= tol
+
+
+AXES_INDEX = dict((name, index) for index, name in enumerate(bifrost_daemon.AXES))
 
 
 def axis_of(motion):
@@ -269,8 +280,40 @@ def test_orbit_returns_home():
     )
 
 
+def camera_tuple(viewport):
+    camera = viewport.camera
+    return (
+        (camera.eye.x, camera.eye.y, camera.eye.z),
+        (camera.target.x, camera.target.y, camera.target.z),
+        (camera.upVector.x, camera.upVector.y, camera.upVector.z),
+    )
+
+
+def roll_of(viewport, world_up=(0.0, 0.0, 1.0)):
+    """How far off level the view is. Zero is a perfect turntable."""
+    eye, target, up = camera_tuple(viewport)
+    return Bifrost.roll_error(eye, target, up, world_up)
+
+
+def elevation_of(viewport, world_up=(0.0, 0.0, 1.0)):
+    eye, target, _up = camera_tuple(viewport)
+    basis = Bifrost.basis_from_up(world_up)
+    direction = Bifrost.v_norm(Bifrost.v_sub(eye, target))
+    _azimuth, elevation = Bifrost.turntable_angles(direction, basis)
+    return math.degrees(elevation)
+
+
+def azimuth_of(viewport, world_up=(0.0, 0.0, 1.0)):
+    eye, target, _up = camera_tuple(viewport)
+    basis = Bifrost.basis_from_up(world_up)
+    direction = Bifrost.v_norm(Bifrost.v_sub(eye, target))
+    azimuth, _elevation = Bifrost.turntable_angles(direction, basis)
+    return math.degrees(azimuth) if azimuth is not None else 0.0
+
+
 def test_pitch_limit():
     print("pitch limit")
+    limit = Bifrost.DEFAULT_ADDIN_CONFIG["pitch_limit_deg"]
     state = new_state()
     viewport = state.app.activeViewport
     for _ in range(200):
@@ -281,12 +324,136 @@ def test_pitch_limit():
     offset = Bifrost.v_norm((eye.x, eye.y, eye.z))
     angle = math.degrees(math.acos(max(-1.0, min(1.0, offset[2]))))
     check(
-        2.0 <= angle <= 178.0,
-        "turntable pitch never crosses the pole (%.1f degrees from world up)" % angle,
+        limit - 1e-6 <= angle <= 180.0 - limit + 1e-6,
+        "turntable pitch never crosses the pole (%.2f degrees from world up, "
+        "limit %.1f)" % (angle, limit),
+    )
+    check(
+        close(abs(elevation_of(viewport)), 90.0 - limit, 1e-6),
+        "pitch parks exactly on the elevation clamp (%.4f degrees)"
+        % elevation_of(viewport),
     )
     check(
         close(Bifrost.v_len((eye.x, eye.y, eye.z)), 100.0, 1e-6),
         "pitch keeps the orbit radius",
+    )
+    check(roll_of(viewport) < 1e-9, "the view is still level at the clamp")
+
+
+def test_turntable_invariants():
+    """A thousand random movements must not tumble, drift or leave the dome."""
+    print("turntable invariants")
+    limit = Bifrost.DEFAULT_ADDIN_CONFIG["pitch_limit_deg"]
+    state = new_state()
+    # An off centre model, so the orbit runs around a pivot that is not the
+    # target: that is the case the old code got wrong.
+    state.app.activeProduct = FakeProduct(FakeBoundingBox((5, -8, -3), (25, 12, 17)))
+    viewport = state.app.activeViewport
+    random.seed(20260918)
+
+    worst_roll = 0.0
+    worst_elevation = 0.0
+    worst_radius = 0.0
+    bursts = 1000
+    for index in range(bursts):
+        # Every so often, pretend Fusion or the mouse moved the camera behind
+        # the add-in's back, which is what the log from the physical test is
+        # full of: wheel zooms, view cube clicks, re-fits while loading.
+        if index % 97 == 0:
+            camera = viewport._camera
+            camera.eye = FakePoint3D(
+                camera.eye.x + random.uniform(-20, 20),
+                camera.eye.y + random.uniform(-20, 20),
+                camera.eye.z + random.uniform(-20, 20),
+            )
+            state.last_motion_at = 0.0  # a gap, so the next input opens a burst
+
+        before = camera_tuple(viewport)
+        before_radius = Bifrost.v_len(Bifrost.v_sub(before[0], before[1]))
+        with state.lock:
+            state.acc[axis_of("yaw")] = random.uniform(-0.4, 0.4)
+            state.acc[axis_of("pitch")] = random.uniform(-0.4, 0.4)
+        state.apply()
+
+        worst_roll = max(worst_roll, roll_of(viewport))
+        elevation = elevation_of(viewport)
+        worst_elevation = max(worst_elevation, abs(elevation))
+        after = camera_tuple(viewport)
+        after_radius = Bifrost.v_len(Bifrost.v_sub(after[0], after[1]))
+        worst_radius = max(worst_radius, abs(after_radius - before_radius))
+
+    check(
+        worst_roll < 1e-6,
+        "up never leaves the world up plane over %d bursts (worst %.2e)"
+        % (bursts, worst_roll),
+    )
+    check(
+        worst_elevation <= 90.0 - limit + 1e-6,
+        "elevation stays inside the clamp (worst %.4f, limit %.4f degrees)"
+        % (worst_elevation, 90.0 - limit),
+    )
+    check(
+        worst_radius < 1e-6,
+        "a pure orbit keeps the eye to target distance (worst drift %.2e cm)"
+        % worst_radius,
+    )
+
+    # The same run, but with the input coming in one frame at a time rather
+    # than as whole bursts, which is how the add-in really sees it.
+    state = new_state()
+    viewport = state.app.activeViewport
+    worst_roll = 0.0
+    for _ in range(2000):
+        with state.lock:
+            state.acc[axis_of("yaw")] = random.uniform(-0.02, 0.02)
+            state.acc[axis_of("pitch")] = random.uniform(-0.02, 0.02)
+        state.apply()
+        worst_roll = max(worst_roll, roll_of(viewport))
+    check(
+        worst_roll < 1e-6,
+        "2000 small steps do not accumulate roll either (worst %.2e)" % worst_roll,
+    )
+
+    # Roll that is already in the camera when a burst opens gets cleaned up,
+    # rather than being taken as the new level.
+    state = new_state()
+    viewport = state.app.activeViewport
+    viewport._camera.upVector = FakeVector3D(0.6, 0.0, 0.8)
+    check(roll_of(viewport) > 0.1, "the test camera really is rolled to start with")
+    with state.lock:
+        state.acc[axis_of("yaw")] = 0.01
+    state.apply()
+    check(
+        roll_of(viewport) < 1e-9,
+        "a rolled camera is levelled by the first orbit (%.2e)" % roll_of(viewport),
+    )
+
+
+def test_roll_is_ignored_in_turntable():
+    print("roll")
+    state = new_state()
+    state.config["roll_speed"] = 0.5
+    viewport = state.app.activeViewport
+    before = camera_tuple(viewport)
+    with state.lock:
+        state.acc[axis_of("roll")] = 0.5
+    state.apply()
+    after = camera_tuple(viewport)
+    check(
+        before == after,
+        "turntable mode ignores roll even when roll_speed is on",
+    )
+
+    state = new_state()
+    state.config["roll_speed"] = 0.5
+    state.config["orbit_mode"] = "free"
+    viewport = state.app.activeViewport
+    with state.lock:
+        state.acc[axis_of("roll")] = 0.5
+    state.apply()
+    check(
+        roll_of(viewport) > 0.1,
+        "free mode still rolls (%.3f)" % roll_of(viewport),
     )
 
 
@@ -547,6 +714,171 @@ def test_bursts():
     )
 
 
+class StubConfig(object):
+    """Just enough of daemon.Config for the Bridge's shaping to run."""
+
+    def __init__(self):
+        self.data = bifrost_daemon.DEFAULTS
+
+    def section(self, name):
+        return dict(self.data.get(name, {}))
+
+
+def feed(state, raw, seconds=0.8, dt=1.0 / 60.0):
+    """Hold raw spacenavd counts on the puck and let the whole chain run.
+
+    Counts go through the daemon's deadzone, response curve, dominant group
+    gating and smoothing, out as the JSON the add-in reads, and into the
+    accumulator. One apply() at the end stands in for the camera update.
+    """
+    bridge = bifrost_daemon.Bridge(StubConfig())
+    daemon_cfg = bifrost_daemon.DEFAULTS["daemon"]
+    addin_cfg = bifrost_daemon.DEFAULTS["addin"]
+    seen = [0.0] * 6
+    for _ in range(int(seconds / dt)):
+        values = bridge.shape(list(raw), daemon_cfg, addin_cfg, dt)
+        for index in range(6):
+            seen[index] += abs(values[index]) * dt
+        with state.lock:
+            for index in range(6):
+                state.acc[index] += values[index] * dt
+    state.apply()
+    return seen
+
+
+def test_cross_talk():
+    """One deliberate push plus three stray axes must move one thing only.
+
+    The hardware recording in tests/fixtures/hardware shows every push leaking
+    into every axis: lifting the puck puts 52 counts on rz, pushing right puts
+    42 on z. Before the response curve and the group gating, a single nudge
+    orbited, panned and zoomed at the same time, which is exactly what made the
+    view feel like it was tumbling.
+    """
+    print("cross talk")
+    dominant = 350
+    stray = 60
+
+    # Rotation wins: only the elevation may change.
+    state = new_state()
+    viewport = state.app.activeViewport
+    before = camera_tuple(viewport)
+    before_extents = viewport.camera.viewExtents
+    raw = [stray, 0, stray, dominant, stray, 0]  # x, y, z, rx, ry, rz
+    seen = feed(state, raw)
+    check(
+        seen[AXES_INDEX["rx"]] > 0.5,
+        "the dominant axis carries the movement (%.3f unit seconds)"
+        % seen[AXES_INDEX["rx"]],
+    )
+    check(
+        all(seen[AXES_INDEX[name]] == 0.0 for name in ("x", "y", "z", "ry", "rz")),
+        "the three stray axes reach the add-in as exactly zero (%s)"
+        % ", ".join(
+            "%s=%.4f" % (name, seen[AXES_INDEX[name]]) for name in ("x", "z", "ry")
+        ),
+    )
+    expected = -math.degrees(
+        seen[AXES_INDEX["rx"]] * Bifrost.DEFAULT_ADDIN_CONFIG["orbit_speed"]
+    )
+    check(
+        close(elevation_of(viewport), expected, 1e-6),
+        "the camera turned exactly input times orbit_speed (%.3f degrees, "
+        "expected %.3f)" % (elevation_of(viewport), expected),
+    )
+    check(
+        close(azimuth_of(viewport), -90.0, 1e-9),
+        "no yaw leaked in (azimuth %.9f degrees)" % azimuth_of(viewport),
+    )
+    check(
+        close(viewport.camera.viewExtents, before_extents, 1e-12),
+        "no zoom leaked in",
+    )
+    after = camera_tuple(viewport)
+    check(
+        close(
+            Bifrost.v_len(Bifrost.v_sub(after[0], after[1])),
+            Bifrost.v_len(Bifrost.v_sub(before[0], before[1])),
+            1e-9,
+        ),
+        "no dolly leaked in",
+    )
+    check(roll_of(viewport) < 1e-9, "and the view is still level")
+
+    # Translation wins: only the target may move, sideways.
+    state = new_state()
+    viewport = state.app.activeViewport
+    before = camera_tuple(viewport)
+    before_extents = viewport.camera.viewExtents
+    seen = feed(state, [dominant, stray, 0, stray, stray, 0])
+    check(
+        seen[AXES_INDEX["x"]] > 0.5
+        and all(seen[AXES_INDEX[n]] == 0.0 for n in ("y", "z", "rx", "ry", "rz")),
+        "a sideways push arrives on x alone",
+    )
+    after = camera_tuple(viewport)
+    check(
+        abs(after[1][0] - before[1][0]) > 1.0,
+        "the pan moved the view (%.3f cm)" % (after[1][0] - before[1][0]),
+    )
+    check(
+        close(azimuth_of(viewport), -90.0, 1e-9)
+        and close(elevation_of(viewport), 0.0, 1e-9),
+        "no rotation leaked into a pan",
+    )
+    check(
+        close(viewport.camera.viewExtents, before_extents, 1e-12),
+        "no zoom leaked into a pan",
+    )
+
+    # Zoom wins: only viewExtents may change.
+    state = new_state()
+    viewport = state.app.activeViewport
+    before = camera_tuple(viewport)
+    before_extents = viewport.camera.viewExtents
+    seen = feed(state, [stray, dominant, stray, stray, 0, 0])
+    check(
+        seen[AXES_INDEX["y"]] > 0.5
+        and all(seen[AXES_INDEX[n]] == 0.0 for n in ("x", "z", "rx", "ry", "rz")),
+        "a lift arrives on y alone",
+    )
+    after = camera_tuple(viewport)
+    check(
+        abs(viewport.camera.viewExtents - before_extents) > 1.0,
+        "the zoom moved the view (%.4f -> %.4f)"
+        % (before_extents, viewport.camera.viewExtents),
+    )
+    check(
+        before[0] == after[0] and before[1] == after[1],
+        "an orthographic zoom moved nothing else at all",
+    )
+
+
+def test_speed_defaults():
+    """Full deflection has to land on numbers a hand can live with."""
+    print("speeds")
+    config = Bifrost.DEFAULT_ADDIN_CONFIG
+    orbit_deg = math.degrees(config["orbit_speed"])
+    check(
+        85.0 <= orbit_deg <= 95.0,
+        "a second of full deflection orbits about 90 degrees (%.1f)" % orbit_deg,
+    )
+    check(
+        0.9 <= config["pan_speed"] <= 1.1,
+        "a second of full deflection pans about one viewport width (%.2f)"
+        % config["pan_speed"],
+    )
+    zoom_factor = math.exp(config["zoom_speed"])
+    check(
+        1.9 <= zoom_factor <= 2.1,
+        "a second of full deflection zooms about a factor two (%.3f)" % zoom_factor,
+    )
+    check(
+        close(90.0 - config["pitch_limit_deg"], 89.0),
+        "elevation is clamped at 89 degrees",
+    )
+
+
 def test_idle_is_free():
     print("idle")
     state = new_state()
@@ -561,8 +893,12 @@ def main():
     test_vector_helpers()
     test_orbit_returns_home()
     test_pitch_limit()
+    test_turntable_invariants()
+    test_roll_is_ignored_in_turntable()
     test_pan_and_zoom()
     test_orbit_pivot()
+    test_cross_talk()
+    test_speed_defaults()
     test_bursts()
     test_button_fit()
     test_message_handling()
