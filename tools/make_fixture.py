@@ -92,17 +92,94 @@ def axis_matrix():
     return blob
 
 
+# Below this a frame counts as the puck sitting still. Same number as
+# tools/calibrate.py uses to split the recording into movements.
+QUIET = 25
+
+
+def split_capture(blob, quiet=QUIET, min_frames=10):
+    """Cut a raw recording into the movements it holds.
+
+    A raw spacenavd capture contains no frames at all while the puck is still,
+    so the pauses the hand made are simply missing and --replay runs the whole
+    recording together as one long movement. Splitting on the quiet frames that
+    are there and splicing proper silence back in gives a fixture whose bursts
+    line up with what the hand actually did.
+    """
+    movements = []
+    current = []
+    for index in range(len(blob) // 32):
+        frame = blob[index * 32 : (index + 1) * 32]
+        values = struct.unpack(FRAME, frame)
+        if values[0] != UEV_MOTION:
+            continue
+        if max(abs(v) for v in values[1:7]) > quiet:
+            current.append(frame)
+        elif current:
+            if len(current) >= min_frames:
+                movements.append(b"".join(current))
+            current = []
+    if len(current) >= min_frames:
+        movements.append(b"".join(current))
+    return movements
+
+
+def from_capture(path, quiet=QUIET):
+    """A replayable fixture built from a real recording, one burst per movement."""
+    with open(path, "rb") as handle:
+        blob = handle.read()
+    movements = split_capture(blob, quiet)
+    return gap().join([b""] + movements) + gap(), movements
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--axis", choices=AXES, help="write a single axis burst")
     parser.add_argument("--sign", type=int, default=1, choices=(1, -1))
     parser.add_argument("--counts", type=int, default=MATRIX_COUNTS)
     parser.add_argument("--out", help="where the single axis burst goes")
+    parser.add_argument(
+        "--from-capture",
+        metavar="FILE",
+        help="split a real recording into bursts and splice silence between them",
+    )
     args = parser.parse_args(argv)
 
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out_dir = os.path.join(here, "tests", "fixtures")
     os.makedirs(out_dir, exist_ok=True)
+
+    if args.from_capture:
+        blob, movements = from_capture(args.from_capture)
+        path = args.out or os.path.join(out_dir, "hardware", "movements.bin")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(blob)
+        print(
+            "%s: %d frames, %d movements, about %.0f s of replay"
+            % (
+                path,
+                len(blob) // 32,
+                len(movements),
+                len(blob) / 32.0 * PERIOD_MS / 1000.0,
+            )
+        )
+        for index, movement in enumerate(movements):
+            peak = [0] * 6
+            for frame in range(len(movement) // 32):
+                values = struct.unpack(FRAME, movement[frame * 32 : frame * 32 + 32])
+                for axis in range(6):
+                    if abs(values[1 + axis]) > abs(peak[axis]):
+                        peak[axis] = values[1 + axis]
+            print(
+                "  %2d  %5.2f s  %s"
+                % (
+                    index + 1,
+                    len(movement) / 32.0 * PERIOD_MS / 1000.0,
+                    " ".join("%s=%+4d" % (AXES[a], peak[a]) for a in range(6)),
+                )
+            )
+        return 0
 
     if args.axis:
         path = args.out or os.path.join(
