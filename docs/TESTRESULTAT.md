@@ -452,6 +452,11 @@ med riktig hardvarudata inspelad fran pucken, och 30,0 kamerauppdateringar per
 sekund. Det som inte gar att veta forran handen ar pa pucken ar om
 kanslighetskurvan och teckenvalen kanns ratt i praktiken.
 
+Riggen ar forberedd for det passet: `log_level` star pa `debug` i Elias config,
+sa varje rorelse lamnar tva rader i `bifrost.log` med kameran fore och efter.
+Da gar T6b att lasa av i loggen i stallet for att bedomas pa kanslan. Satt
+tillbaka till `info` nar det ar gjort.
+
 ---
 
 ## Sammanfattning
