@@ -3,7 +3,7 @@
 Maskin: vanessa, Arch (Omarchy 4.x), Hyprland pa Wayland, GTX 1080 Ti.
 spacenavd 1.3.1-1, libspnav 1.2-1, Fusion 2705.1.15 i Wine-prefixet
 `~/.autodesk_fusion/wineprefixes/default`, patchad wine ur `~/fusion-wine-build`.
-Datum: 2026-09-11 (T1 till T5) och 2026-09-18 (T6a).
+Datum: 2026-09-11 (T1 till T5) och 2026-09-18 (T6a, T6b och T7).
 
 Alla siffror nedan ar uppmatta, inte uppskattade.
 
@@ -435,27 +435,303 @@ pivot- och burstlogiken inraknad, `tests/test_daemon.py` gar pa 26.
 
 ---
 
-## T6b: fysisk slutverifiering (aterstar)
+## T7: kanslofixen (2026-09-18)
 
-**Utfall: inte kord.** Kvar att gora med handen pa pucken, i denna ordning:
+**Utfall: godkant.** T6b kordes med handen pa pucken och domen blev "fungerar
+jattedaligt". Loggen fran det passet (14:14 till 14:16) sager exakt varfor, och
+det har passet atgardar det och mater att det ar atgardat.
 
-1. Kanns nagon riktning bakvand, flippa den flaggan: `invert.dolly` for zoom,
-   `invert.pitch` eller `invert.yaw` for rotationerna. En flagga i taget, och
-   `systemctl --user restart bifrost.service` emellan.
-2. Kanns kansligheten fel: `sensitivity` for allt, annars `orbit_speed`,
-   `pan_speed`, `zoom_speed` var for sig. Daemondelen laddas om utan omstart.
-3. Kryper vyn i vila trots `deadzone` 30, hoj till 40.
-4. Vill Elias bygga om mappningen fran grunden: `python3 tools/calibrate.py`.
+### Vad loggen fran den fysiska korningen faktiskt visade
 
-Det som bevisligen fungerar redan: hela kedjan fran ra spnav-data till kameran,
-med riktig hardvarudata inspelad fran pucken, och 30,0 kamerauppdateringar per
-sekund. Det som inte gar att veta forran handen ar pa pucken ar om
-kanslighetskurvan och teckenvalen kanns ratt i praktiken.
+Tre saker, i fallande ordning av hur mycket de forstorde kanslan:
 
-Riggen ar forberedd for det passet: `log_level` star pa `debug` i Elias config,
-sa varje rorelse lamnar tva rader i `bifrost.log` med kameran fore och efter.
-Da gar T6b att lasa av i loggen i stallet for att bedomas pa kanslan. Satt
-tillbaka till `info` nar det ar gjort.
+1. **Overhorning.** Varje knuff landade pa alla sex axlarna samtidigt. En enda
+   burst bar `rx=+0.87, ry=+0.69, rz=+0.60` och samtidigt `y=+0.24`. Med en rak
+   mappning blir det orbit, panorering och zoom i samma rorelse, varje gang.
+   Hardvaruinspelningen i repot visar samma sak i raa counts: att lyfta pucken
+   ger 52 counts pa `rz`, att skjuta at hoger ger 42 pa `z`.
+2. **Hastigheten.** `orbit_speed` 2,5 ar 143 grader per sekund. En burst pa fyra
+   sekunder med `ry=+1.03` svangde vyn **148 grader**. Det ar inte att navigera,
+   det ar att kasta kameran.
+3. **Polgransen.** `pitch_limit_deg` 2,0 slapper fram elevation nastan rakt
+   underifran. I burstarna runt 14:15 star kameran pa elevation -88 grader, och
+   da ar en yaw en snurr kring blickriktningen. Det ar det som ser ut som att
+   vyn tumlar.
+
+**En ratting mot arbetsordern:** upp-vektorerna i den loggen ar inte rullade.
+`up=(-0.912, 0.409, 0.036)` och `up=(-0.056, 0.595, 0.802)` ser fel ut men ar
+bada exakt den korrekta turntable-upp-vektorn for sin elevation: rakna efter, och
+`up_z` = cos(elevation) och den horisontella delen = -sin(elevation) gonger
+blickriktningens horisontalprojektion, pa tre decimaler. Den gamla koden hade
+alltsa ingen faktisk rulldrift i just det passet. Den hade daremot **ingenting
+som hindrade den**: den roterade de levande eye-, target- och up-vektorerna ett
+steg till varje bildruta, tog sin pitch-axel ur den up-vektor Fusion senast
+lamnade tillbaka, och lat alltsa vilken rull som helst, fran vykuben, fran en
+musorbit eller fran att Fusion gor om vyn, bli permanent och vaxa. Dessutom
+maette polgransen fel vektor (`eye - target` i stallet for `eye - pivot`), sa
+gransen betydde inte vad den sa. Bada delarna ar borta nu, se nedan.
+
+### Vad som andrades
+
+| | Fore | Efter |
+| --- | --- | --- |
+| Responskurva | rak linje | kvadratisk, `daemon.response.exponent` |
+| Overhorningsskydd | inget | en grupp per bildruta plus axelgallring |
+| Glattning | ingen | EMA, 50 ms |
+| `orbit_speed` | 2,5 (143 grader/s) | 1,5708 (90 grader/s) |
+| `zoom_speed` | 1,2 (faktor 3,3/s) | 0,6931 (faktor 2/s) |
+| `pitch_limit_deg` | 2,0 | 1,0, alltsa elevation klampad till 89 grader |
+| Turntable | inkrementell rotation av levande vektorer | byggd ur azimut och elevation varje bildruta |
+| Roll i turntable | kunde sla igenom | ignoreras helt |
+
+Turntablen ar karnan: kameratillstandet ar azimut, elevation, radie och pivot,
+och `eye` och `up` byggs ur dem och `world_up` varje bildruta. Vinklarna lases in
+ur kameran nar en burst oppnar, och igen sa fort kameran visar sig ha flyttat sig
+bakom ryggen pa add-inet, vilket den ofta gor: mushjulet satter `viewExtents` och
+skjuter ut `eye` till tio ganger det, och Fusion gor om vyn medan en assembly
+laddar. Rullfel ar darmed inte nagot som rattas, det ar nagot som inte gar att
+uttrycka.
+
+### Matt utanfor Fusion
+
+`tests/test_camera_math.py` vaxte fran 42 till 72 kontroller, alla grona. De nya:
+
+```
+turntable invariants
+  [PASS] up never leaves the world up plane over 1000 bursts (worst 1.11e-16)
+  [PASS] elevation stays inside the clamp (worst 87.4829, limit 89.0000 degrees)
+  [PASS] a pure orbit keeps the eye to target distance (worst drift 4.26e-14 cm)
+  [PASS] 2000 small steps do not accumulate roll either (worst 5.55e-17)
+  [PASS] a rolled camera is levelled by the first orbit (0.00e+00)
+cross talk
+  [PASS] the dominant axis carries the movement (0.758 unit seconds)
+  [PASS] the three stray axes reach the add-in as exactly zero (x=0.0000, z=0.0000, ry=0.0000)
+  [PASS] the camera turned exactly input times orbit_speed (-68.209 degrees, expected -68.209)
+  [PASS] no yaw leaked in (azimuth -90.000000000 degrees)
+  [PASS] a sideways push arrives on x alone
+  [PASS] a lift arrives on y alone
+  [PASS] an orthographic zoom moved nothing else at all
+```
+
+De tusen slumpburstarna kor mot en modell som ligger **utanfor** kamerans target,
+alltsa precis det fall den gamla koden hanterade samst, och var 97:e burst
+knuffas kameran dessutom till en slumpmassig plats for att harma en musorbit
+eller en omgjord vy. Overhorningstestet gar hela vagen: raa counts in i
+daemonens `shape()`, ut genom JSON-strommen, in i add-inets ackumulator och ut
+som en kamerarorelse.
+
+Daemonsidan mats for sig i `tests/test_daemon.py`, som vaxte fran 26 till 44
+kontroller och nu kor uppspelningen tva ganger: en gang med `exponent: 1.0`,
+ingen gallring och ingen glattning, sa att alla gamla ledningskontroller galler
+oforandrade, och en gang med det som faktiskt skeppas. Totalt star de tre
+sviterna pa **153 kontroller, alla grona** (72 + 44 + 37).
+
+```
+input shaping
+  [PASS] full deflection is 1.0 and does not run away past it (1.0000, 1.0000)
+  [PASS] half deflection is a quarter of full speed (0.2500)
+  [PASS] a 60 count stray axis is under one percent of full speed (0.0088)
+  [PASS] the groups follow the measured axis map ({'rotate': [3, 4], 'translate': [0, 2], 'zoom': [1]})
+  [PASS] rz is left out while roll is off in turntable mode
+  [PASS] 350 counts with three 60 count strays comes out as one axis ([0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+  [PASS] a lift with its measured rz cross talk is a clean zoom ([0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
+  [PASS] the smoothing settles to exact zero after release (21 frames, 0.35 s)
+shaped replay
+  [PASS] rotation and translation never arrive in the same frame
+  [PASS] zoom never shares a frame with anything else
+```
+
+### Matt i Fusion: axelmatrisen
+
+`tests/fixtures/axis_matrix.bin` genom `--replay --replay-wait` mot dokumentet
+`Latency_tester_assembly_v8`. Tolv burstar in, **tio** ut: `rz`-burstarna nar
+inte ens fram till add-inet langre, eftersom roll ar avstangd i turntable-lage
+och daemonen darfor gallrar bort axeln helt. Det ar overhorningsskyddet synligt
+i loggen.
+
+```
+time      input        roll        d_az     d_el   |d_eye|     d_ext    scale
+15:07:24  x=+0.0354    1.11e-16    0.00     0.00    0.6944    0.0000   19.646
+15:07:27  x=-0.0354    5.55e-17    0.00     0.00    0.6944    0.0000   19.646
+15:07:30  y=+0.0342    5.55e-17    0.00     0.00    0.0000    0.2271   20.117
+15:07:32  y=-0.0342    5.55e-17    0.00     0.00    0.0000   -0.2272   19.646
+15:07:35  z=+0.0354    0.00e+00    0.00     0.00    0.6948    0.0000   19.646
+15:07:38  z=-0.0354    5.55e-17    0.00    -0.00    0.6957    0.0000   19.646
+15:07:41  rx=+0.0354   2.78e-17   -0.40    -3.13    1.3321    0.0000   19.646
+15:07:44  rx=-0.0354   2.78e-17    0.40     3.13    1.3321    0.0000   19.646
+15:07:47  ry=+0.0354   8.33e-17   -3.18     0.00    1.0938    0.0000   19.646
+15:07:50  ry=-0.0354   2.78e-17    3.18     0.00    1.0938    0.0000   19.646
+```
+
+Varje rad rors en sak: panoreringsburstarna har `d_az` och `d_el` pa noll och
+`d_ext` pa noll, zoomburstarna ror inte `eye` alls, rotationsburstarna ror inte
+`viewExtents`. Beloppen stammer mot formlerna:
+
+* **Panorering**: 0,0354 x `pan_speed` 1,0 x synlig bredd 19,646 = 0,6955 cm,
+  uppmatt 0,6944 i sidled och 0,6948 i hojdled. Samma tal i bada riktningarna,
+  vilket ar det som sagerats att panoreringsskalan ar ratt aven i ortografisk vy:
+  den mats live med `viewToModelSpace` och loggas numera per burst som `scale=`.
+* **Zoom**: exp(0,0342 x 0,6931) = 1,02399, uppmatt 1,02397.
+* **Orbit**: 0,0354 x 1,5708 rad = 3,186 grader, uppmatt 3,18 i yaw.
+
+Pitchraderna ger 3,13 i stallet for 3,186, och 0,40 graders `d_az` pa kopet. Det
+ar inte ett fel utan foljden av att orbiten gar kring modellens centrum och inte
+kring target: vinkeln som loggas mats pa `eye - target`, och nar target ligger
+vid sidan av pivoten svanger den vektorn nagot annorlunda an `eye - pivot`, som
+ar den som faktiskt roteras. Yaw kring world-Z paverkas inte, vilket ar precis
+darfor yawraderna stammer exakt.
+
+**Rullfelet ar hogst 1,11e-16 i samtliga tio burstar.** Storheten som mats ar
+beloppet av `right . world_up` dar `right = forward x up`, alltsa hur langt fran
+vagratt kamerans hogervektor star. Noll betyder att vyn ar exakt i vag. Det ar
+den matbara formen av "vyn tumlar inte", och den rakna maste goras sa har:
+`up` sjalv ar (0, 0, 1) bara vid elevation noll, den **ska** luta med elevationen.
+
+### Matt i Fusion: Elias verkliga hand
+
+Hardvaruinspelningen `tests/fixtures/hardware/calibration_capture.bin` ar 42
+sekunder med handen pa pucken. En raa inspelning innehaller inga rutor alls
+medan pucken star stilla, sa den spelas upp som en enda lang rorelse. Nytt
+verktygslage klipper isar den pa de tysta rutorna och skarvar in riktig tystnad
+emellan:
+
+```bash
+python3 tools/make_fixture.py --from-capture tests/fixtures/hardware/calibration_capture.bin
+```
+
+Det ger `tests/fixtures/hardware/movements.bin`, 14 rorelser, 47 sekunder, med
+overhorningen kvar precis som handen gjorde den (rorelse 8: `y=+350` med
+`rz=+105`, `rx=+63` och `ry=-50` pa kopet). Uppspelat mot Fusion:
+
+```
+time      input        roll        d_az     d_el   |d_eye|     d_ext    scale
+15:08:50  x=+0.6318    1.94e-16   -0.00    -0.00   12.4126    0.0000   19.646
+15:08:52  x=+0.6420    1.67e-16    0.00     0.00   12.6134    0.0000   19.646
+15:08:55  x=+0.7836    2.78e-17    0.00     0.00   15.3951    0.0000   19.646
+15:08:57  z=+0.6527    1.94e-16   -0.00     0.00   12.8231    0.0000   19.646
+15:09:00  z=+0.7416    3.05e-16    0.00     0.00   14.5696    0.0000   19.646
+15:09:02  z=+0.7325    3.05e-16    0.00     0.00   14.3908    0.0000   19.646
+15:09:04  y=+0.7835    3.05e-16    0.00     0.00    0.0000    6.8330   33.815
+15:09:07  y=+0.9567    3.05e-16    0.00     0.00    0.0000   15.3409   65.626
+15:09:10  rx=-0.8783   2.78e-17   82.74     6.96   83.0486    0.0000   65.626
+15:09:12  rx=-0.7269   0.00e+00   12.90   -20.15   31.8039    0.0000   65.626
+15:09:14  rx=-0.4949   0.00e+00    0.00     0.00    0.0000    0.0000   65.626
+15:09:16  ry=-0.5110   0.00e+00   45.99    -0.00    0.8899    0.0000   65.626
+15:09:18  ry=-0.4414   2.78e-17   39.72     0.00    0.7741    0.0000   65.626
+15:09:20  ry=-0.5568   6.94e-18   50.11    -0.00    0.9650    0.0000   65.626
+```
+
+Tre saker att lasa ur den:
+
+* **Varje rorelse landar pa en axel.** Handen gjorde overhorning pa upp till 105
+  counts, och ingenting av den syns i kolumnen `input`. Den ar noll, inte liten.
+* **`|d_eye|` ar proportionell mot inputen, pa fem vardesiffror.** 0,6318 x
+  19,646 = 12,4123 cm forvantat, 12,4126 uppmatt. 0,7836 x 19,646 = 15,3946
+  forvantat, 15,3951 uppmatt. Zoomen likasa: exp(0,7835 x 0,6931) = 1,72124
+  forvantat, 1,72121 uppmatt. Yawen ocksa: 45,990 grader forvantat, 45,990
+  uppmatt.
+* **Rullfelet ar hogst 3,05e-16** genom hela inspelningen, polgransen inraknad.
+
+De tre pitchraderna ser konstiga ut och ar det inte. Fixturen panorerar tre
+gonger fullt utslag at sidan och tre gonger uppat innan den pitchar, alltsa runt
+40 cm bort fran modellen, och sedan zoomar den ut 3,3 ganger. Da ligger target
+femtio centimeter fran pivoten, och en orbit kring modellens centrum svanger
+`eye - target` med en helt annan vinkel an den som faktiskt roterades. Sista
+pitchraden rorde ingenting alls: elevationen stod da pa klampen 89 grader, och
+klampen haller. Ingen manniska panorerar 40 cm utan att trycka Fit, men fixturen
+gor det, och det ar bra: det ar det extremfall som visar att klampen bar.
+
+### Upp-vektorn bokstavligt
+
+Klampen ar ett exakt verktyg: satter man `pitch_limit_deg` till 90 klamps
+elevationen till exakt noll, och da **ska** `up` vara exakt (0, 0, 1). En fixtur
+med Fit, tre sekunder pitch mot klampen och sedan fyra sekunder ren yaw:
+
+```
+15:10:37 burst end up=(0.000, 0.000, 1.000) az=-173.54 el=+0.00 roll=0.00e+00
+         input=[rx=-3.0613] d_el=-22.06
+15:10:38 burst start up=(0.000, 0.000, 1.000) el=+0.00
+15:10:39 camera update rate: 29.8 Hz, eye=( 2.618, 18.292, 0.797) dist=15.967
+15:10:40 camera update rate: 30.0 Hz, eye=(19.636,  3.349, 0.797) dist=15.967
+15:10:41 camera update rate: 29.7 Hz, eye=( 4.593,-13.580, 0.797) dist=15.967
+15:10:42 burst end up=(0.000, 0.000, 1.000) az=-174.90 el=+0.00 roll=0.00e+00
+         input=[ry=+4.0150] d_az=-1.35
+```
+
+`up` ar (0, 0, 1) pa varje decimal loggen skriver, hela varvet igenom, och `eye`
+har `z = 0.797` i varenda mellanliggande matning, alltsa exakt noll elevation
+genom hela svepet. Inputen 4,0150 enhetssekunder ganger 90 grader per sekund ar
+361,35 grader, och `d_az` ar -1,35, alltsa **ett helt varv plus 1,35 grader**.
+Avstandet eye till target star stilla pa 15,967 cm och takten pa 30,0 Hz.
+
+### Bildbevis
+
+Sjalvtestet kor numera hela sekvensen panorering, orbit och zoom, och renderar
+en ruta per steg med `Viewport.saveAsImageFile`. Det pacas dessutom mot Fusions
+egen handelsko i stallet for mot en vaggklocka: varje injicerat steg vantar tills
+ackumulatorn ar tom. Utan det togs rutorna vid den vinkel som rakade ha hunnits
+med, och resten av orbiten spillde over i nasta rorelse.
+
+![Orbit, panorering och zoom](kansla-orbit-pan-zoom.jpg)
+
+Modellen star uppratt i samtliga rutor: rutnatets horisont lutar likadant i alla
+nio. Och orbiten ar exakt: `bifrost-selftest-0deg.png` och
+`bifrost-selftest-360deg.png` ar **bitidentiska** (samma md5), RMSE 0. Ett helt
+varv kring modellens centrum landar alltsa pa exakt samma pixlar. Sjalvtestet
+kor dessutom `viewport.fit()` forst, sa ramningen blir densamma varje gang
+oavsett vilken kamera Fusion rakade aterstalla.
+
+### En fallgrop till, hittad pa vagen
+
+Rutan `zoom out x2` ar inte bitidentisk med `orbit 360`, trots att kameran ar det:
+`viewExtents` star pa 9,4745, `eye`, `target` och `up` ar oforandrade och
+rullfelet ar noll. Bilden visar anda en cirka 1,31 ganger vidare vy. Orsaken star
+i `scale=` pa burstraderna:
+
+```
+extents=9.4745 scale=14.9929   <- panorering, innan nagon zoom
+extents=9.4745 scale=19.6461   <- efter en zoom in och ut, samma extents
+```
+
+**Fusion raknar om forhallandet mellan `viewExtents` och den synliga
+varldsbredden forsta gangen man skriver till `viewExtents`**, med faktorn 1,3104,
+och behaller det sedan. Det upprepades i tre oberoende korningar: 14:57, 15:07
+och 15:16. `viewport.width` och `viewport.height` ar oforandrade hela tiden, sa
+det ar inte fonstret som andrar sig.
+
+Panoreringen paverkas inte, eftersom bredden mats live med `viewToModelSpace`
+varje bildruta, och det ar just det som replayerna ovan visar: panoreringen
+stammer mot det uppmatta `scale` pa fem vardesiffror bade fore och efter. Men tva
+renderade rutor tagna pa var sin sida om den forsta zoomen gar inte att jamfora
+rakt av. Add-inet loggar darfor `scale=` per burst, och `view scale` om sa fort
+viewporten byter form.
+
+---
+
+## T6b: fysisk slutverifiering (kord, underkand, atgardad i T7)
+
+**Utfall: underkant.** Elias korde passet 2026-09-18 runt 14:14 med handen pa
+pucken. Domen: "fungerar jattedaligt". Loggen fran passet ligger kvar i
+`bifrost.log` och ar underlaget till hela [T7](#t7-kanslofixen-2026-09-18), som
+beskriver vad som var fel och vad som gjordes at det.
+
+Det T6b bekraftade som redan fungerade: hela kedjan fran ra spnav-data till
+kameran, axelmappningen och teckenvalen. Ingen riktning kandes bakvand, ingen
+flagga behovde flippas. Det som var fel var kanslan: overhorning, hastighet och
+polgransen.
+
+### Kvar: ett nytt fysiskt pass med den nya kanslan
+
+1. **Hastigheterna.** Fullt utslag ar nu 90 grader per sekund, en synlig bredd
+   per sekund och faktor tva per sekund. Kanns nagot fel: `orbit_speed`,
+   `pan_speed`, `zoom_speed` var for sig, eller `sensitivity` for allt pa en
+   gang. Daemondelen laddas om inom en sekund utan omstart av nagot.
+2. **Kurvan.** `daemon.response.exponent` 2,0 ger fin kontroll kring mitten.
+   Kanns den seg i smarorelser: 1,5. Vill man ha annu finare precision: 3,0.
+3. **Grupperingen.** En rorelse i taget ar pa som standard. Vill Elias kunna
+   panorera och orbita samtidigt: `dominant_group: false`.
+4. **Glattningen.** 50 ms. Kanns det slappt: 0,02 eller 0.
+5. Kryper vyn i vila trots `deadzone` 30, hoj till 40.
 
 ---
 
@@ -469,7 +745,8 @@ tillbaka till `info` nar det ar gjort.
 | T4 kamerastyrning | godkant | 30,0 kamerauppdateringar/s, orbit utan drift, 2,13 rad/s |
 | T5 reconnect | godkant | ater ansluten 1 till 3 s efter att daemonen kom tillbaka |
 | T6a axelmatris, mappning, pivot | godkant | 12 burstar uppmatta, 5 hardvarurorelser verifierade, 105 kontroller i tre sviter |
-| T6b fysisk slutverifiering | aterstar | kanslighet och teckenval med handen pa pucken |
+| T6b fysisk slutverifiering | underkant | overhorning, 143 grader/s och polgransen 2 grader |
+| T7 kanslofixen | godkant | rullfel under 3,1e-16 i 24 burstar mot Fusion, panorering pa fem vardesiffror, 0 och 360 grader bitidentiska |
 
 ### Kanda begransningar
 
@@ -484,3 +761,8 @@ tillbaka till `info` nar det ar gjort.
   franokopplade. `Viewport.saveAsImageFile` fungerar aven da.
 * Taket 30 Hz ar add-inets `max_fire_hz`. Fusion klarade det genomgaende med
   assemblyn oppen, men under dokumentladdning sjonk det till 10 till 18 Hz.
+* T7 ar matt i replay, inte med handen pa pucken. Att overhorningen ar borta och
+  att vyn inte kan tumla ar uppmatt pa Elias egen inspelning, men om 90 grader
+  per sekund och exponent 2,0 ar ratt siffror for handen gar bara att avgora av
+  handen. Se listan i T6b.
+* Zoomriktningen ar fortfarande ett smakval: `addin.invert.dolly`.

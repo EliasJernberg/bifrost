@@ -91,6 +91,23 @@ Which physical push a device reports as which axis is not something you can look
 up, so all of it was measured: see [docs/AXELMATRIS.md](docs/AXELMATRIS.md).
 Different puck, or something feels backwards? Run the calibration, below.
 
+Two things shape how that feels, and both are on by default:
+
+* **One motion at a time.** A SpaceMouse reports all six axes on every push, so
+  a straight mapping turns one nudge into a simultaneous orbit, pan and zoom.
+  Bifrost keeps only the strongest of turning, sliding and zooming each frame.
+* **A square response curve.** Full deflection is unchanged, half deflection is
+  a quarter of the speed, and the handful of counts that leak onto the other
+  axes are under one percent. Fine work near the centre, full speed at the edge.
+
+At full deflection the defaults give a quarter turn a second, one viewport width
+of pan a second, and a factor two of zoom a second. See
+[Response and cross talk](#response-and-cross-talk) to change any of it.
+
+The view is a turntable: the horizon stays level, the model never tips over
+sideways, and the camera stops one degree short of straight above and straight
+below. `orbit_mode: "free"` gives a true trackball with roll instead.
+
 Stopping the daemon does not break Fusion. The add-in keeps retrying and picks
 the daemon back up within a couple of seconds of it returning.
 
@@ -150,7 +167,18 @@ ever has to be edited.
 | `sensitivity` | `1.0` | global multiplier |
 | `axis_gain` | all `1.0` | per axis multiplier, keys `x y z rx ry rz` |
 | `axis_invert` | all `false` | per axis sign flip |
+| `response` | see below | the curve, the gating and the smoothing |
 | `verbose` | `false` | log every button and device event |
+
+### daemon.response section
+
+| key | default | meaning |
+| --- | --- | --- |
+| `exponent` | `2.0` | `1.0` is a straight line, `2.0` squares, `3.0` cubes |
+| `axis_cut` | `0.1` | drop an axis carrying less than this share of the leading one in its group |
+| `dominant_group` | `true` | keep only one of rotate, translate and zoom per frame |
+| `dominant_hysteresis` | `1.25` | how far another group must beat the current winner to take over |
+| `smoothing_seconds` | `0.05` | exponential smoothing time constant, `0` disables it |
 
 ### addin section
 
@@ -159,20 +187,22 @@ ever has to be edited.
 | `max_fire_hz` | `30` | upper bound on camera updates per second |
 | `map` | see below | which spacenavd axis drives which camera motion |
 | `invert` | `dolly`, `yaw` true | per motion sign flip |
-| `orbit_speed` | `2.5` | radians per unit of accumulated input |
+| `orbit_speed` | `1.5708` | radians per unit of input, so rad/s at full deflection |
 | `pan_speed` | `1.0` | viewport widths per unit of input |
-| `zoom_speed` | `1.2` | e-folds of view scale per unit of input |
-| `roll_speed` | `0.0` | roll is off by default, Fusion has no roll of its own |
+| `zoom_speed` | `0.6931` | e-folds of view scale per unit of input, `ln 2` is a factor two |
+| `roll_speed` | `0.0` | roll is off by default, and ignored entirely in turntable mode |
 | `orbit_mode` | `turntable` | `turntable` keeps world up level, `free` is a true 6DoF orbit |
 | `orbit_pivot` | `auto` | `auto` turns around the model's centre, `target` around the camera target |
 | `idle_gap_seconds` | `0.5` | a pause this long ends one movement and starts the next |
 | `world_up` | `[0, 0, 1]` | up axis for turntable mode |
-| `pitch_limit_deg` | `2.0` | how close to the pole turntable pitch may get |
+| `pitch_limit_deg` | `1.0` | how close to the pole turntable pitch may get, so elevation is clamped to 89 degrees |
 | `min_distance` | `0.01` | closest a perspective camera may dolly to its target |
 | `fit_button` | `5` | button number for fit, `"first"` learns it, `-1` disables |
-| `selftest` | `false` | run a scripted 360 degree orbit once a design is open |
-| `selftest_seconds` | `3.0` | how long that orbit takes |
+| `selftest` | `false` | run a scripted pan, orbit and zoom once a design is open |
+| `selftest_seconds` | `3.0` | sets the number of orbit steps, 30 per second |
 | `selftest_pan` | `0.0` | viewport widths to pan before that orbit |
+| `selftest_zoom` | `0.0` | e-folds to zoom in and back out after it, `0.6931` is a factor two |
+| `selftest_fit` | `true` | fit the view first, so the frames are framed the same every run |
 | `selftest_wait_seconds` | `600` | how long to wait for a design to appear |
 | `selftest_settle_seconds` | `3.0` | how long the camera must hold still first |
 | `selftest_image_dir` | `""` | where the rendered orbit frames go, empty means next to the log |
@@ -201,6 +231,62 @@ depends on the device and on how spacenavd is set up: on the device this was
 built for, translation and rotation do not even share a handedness. That is
 exactly why this is a config table and not hard-coded, and the whole measurement
 is in [docs/AXELMATRIS.md](docs/AXELMATRIS.md).
+
+### Response and cross talk
+
+A SpaceMouse has no isolated axes. The hardware recording in this repo shows
+every push leaking into all six: pushing right puts about 42 counts on `z`,
+lifting puts about 52 on `rz`, and a hand that means to twist is also tilting a
+little. Fed straight through, one nudge orbits, pans and zooms at once, the view
+ends up somewhere nobody asked for, and the puck feels broken rather than
+imprecise. Three cheap stages in the daemon fix it, all under `daemon.response`:
+
+1. **The curve.** The deadzoned magnitude is raised to `exponent` before it
+   becomes speed. Full deflection still means full speed, half deflection means
+   a quarter of it, and 60 counts of leakage next to a 350 count push drops from
+   19 percent of full speed to 0.9 percent. This is also what makes slow, precise
+   work possible at all: near the centre the puck is four times finer than a
+   straight line makes it.
+2. **One group per frame.** The six motions fall into three groups, rotate
+   (`pitch`, `yaw`, `roll`), translate (`pan_x`, `pan_y`) and zoom (`dolly`).
+   The strongest group wins the frame and the other two are set to zero, so
+   going from an orbit into a pan stops the orbit instead of blending the two.
+   `dominant_hysteresis` keeps a gesture from flickering between groups, and the
+   groups are built from your own `map`, so a recalibrated puck groups itself.
+   Inside the winning group, `axis_cut` drops any axis carrying less than a
+   tenth of the leading one: a deliberate diagonal orbit survives, a stray
+   sixtieth does not.
+3. **Smoothing.** A 50 ms exponential filter takes the hand tremor out without
+   any perceptible lag. It settles to exactly zero, so the stream still goes
+   quiet when you let go.
+
+Set `exponent` to `1.0`, `dominant_group` to `false` and `smoothing_seconds` to
+`0` to get the raw stream back, which is what the plumbing tests use. All of it
+lives in the `daemon` section, so the file is re-read within a second and you
+can tune it with Fusion running.
+
+### The turntable
+
+`orbit_mode: "turntable"` means the camera has exactly two degrees of freedom
+around its pivot: azimuth, how far round it has been turned, and elevation, how
+far above or below the horizon it sits. The eye and the up vector are rebuilt
+from those two numbers and `world_up` on every single frame, never nudged a
+little further from wherever they happened to be. That has three consequences
+worth knowing:
+
+* **The view cannot roll.** Not after a thousand movements, not after a pitch
+  near the pole. The up vector is constructed level, so roll is not something
+  that is corrected, it is something that cannot be expressed.
+* **Elevation is clamped for real,** at `90 - pitch_limit_deg` degrees, because
+  the clamp is applied to the number the camera is built from rather than to a
+  rotation that has already happened.
+* **A mouse orbit, a view cube click or a wheel zoom in between is fine.** The
+  angles are read back off the camera when a movement starts, and again whenever
+  the camera turns out to have moved behind the add-in's back.
+
+Roll is ignored in turntable mode however `roll_speed` is set. Use
+`orbit_mode: "free"` for a true trackball where the up vector goes where the
+puck puts it.
 
 ### The orbit pivot
 
@@ -244,20 +330,35 @@ over synthetic streams and over the real recording in
 
 `tools/make_fixture.py` writes the fixtures, including `axis_matrix.bin`: twelve
 single axis bursts, plus and minus on all six axes, which is what the axis matrix
-was measured with.
+was measured with. It also turns a real recording into a replayable one:
+
+```bash
+python3 tools/make_fixture.py --from-capture tests/fixtures/hardware/calibration_capture.bin
+```
+
+A raw capture holds no frames at all while the puck is still, so the pauses the
+hand made are simply missing and `--replay` runs the whole thing together as one
+movement. That splits it on the quiet frames and splices real silence back in,
+giving one burst per movement with the hand's own cross talk intact.
 
 Measured results for all of it, including what happens inside Fusion, are in
 [docs/TESTRESULTAT.md](docs/TESTRESULTAT.md) (Swedish), and the axis by axis
 measurement behind the default mapping is in
 [docs/AXELMATRIS.md](docs/AXELMATRIS.md) (Swedish).
 
-Setting `"selftest": true` makes the add-in drive a scripted 360 degree orbit
-as soon as a design is open, and render the viewport at 0, 90, 180, 270 and 360
-degrees to PNG files next to the log. That is the quickest way to prove the
-camera path works on a machine where taking a screenshot is awkward. Adding
-`"selftest_pan": 1.0` shoves the model a full viewport width off centre first,
-which is how the auto pivot is shown to work: the model stays put through the
-orbit instead of sweeping across the view.
+Setting `"selftest": true` makes the add-in fit the view as soon as a design is
+open and then drive a scripted pan, a 360 degree orbit and a zoom, rendering the
+viewport to PNG files next to the log at every step. That is the quickest way to
+prove the camera path works on a machine where taking a screenshot is awkward.
+Adding `"selftest_pan": 0.25` shoves the model off centre first, which is how the
+auto pivot is shown to work: the model stays put through the orbit instead of
+sweeping across the view. `"selftest_zoom": 0.6931` adds a factor two in and back
+out at the end.
+
+Each step waits for Fusion's event queue to drain rather than for a wall clock,
+so the frames land on exact angles however slowly the viewport is redrawing. The
+proof that it works is that the 0 degree and the 360 degree frame come out byte
+identical.
 
 ## Troubleshooting
 
@@ -304,14 +405,20 @@ clients at once and Bifrost is just one more. If it does, restart spacenavd.
   drawn while a movement is running and cleared when it ends.
 * Per button actions beyond Fit, so the rest of the SpaceMouse Pro keypad does
   something useful.
-* A sensitivity curve, so small deflections are finer than a straight line makes
-  them.
+* A pan that recentres the auto pivot. Pan far enough and the orbit still turns
+  around the model you left behind, which is correct and occasionally surprising.
+  Fit puts it right.
 
 ## Known limits
 
 * Only the fit button is mapped. The other SpaceMouse buttons are logged and
   ignored.
-* Roll is wired up but off by default (`roll_speed: 0.0`).
+* Roll is wired up but ignored in turntable mode, which is the default, and off
+  by default in free mode too (`roll_speed: 0.0`).
+* Only one motion group happens per frame by default, so a deliberate pan while
+  orbiting is not possible. `dominant_group: false` turns that off.
+* Turntable elevation stops one degree short of the pole and stays there: push
+  further and nothing moves, which is the clamp doing its job.
 * The camera update rate is capped at 30 Hz by `max_fire_hz`. Fusion's own
   custom event queue is the bottleneck, not the daemon, which runs at 60 Hz.
 * Changing `listen_port` means editing the constant in `Bifrost.py` too, since
@@ -324,8 +431,13 @@ clients at once and Bifrost is just one more. If it does, restart spacenavd.
   inside the viewport. Zoom into a corner of a big assembly and the orbit still
   turns around the centre of the whole visible model.
 * `log_level: "debug"` adds two lines per movement, before and after, with the
-  camera and the integrated input. That is how the axis matrix was measured, and
-  it is the first thing to turn on when a motion behaves oddly.
+  camera, the integrated input, the azimuth, the elevation, the roll error and
+  the world width panning was scaled against. That is how the axis matrix was
+  measured, and it is the first thing to turn on when a motion behaves oddly.
+* Fusion recomputes the relationship between `viewExtents` and the visible world
+  width the first time anything writes to `viewExtents`, by a factor of about
+  1.31 on this setup. Panning follows, since the width is measured live, but two
+  rendered frames taken on either side of the first zoom are not comparable.
 
 ## Licence
 

@@ -15,6 +15,15 @@ Två oberoende mätningar ligger till grund:
 
 Ingen siffra nedan är uppskattad.
 
+> **Notera:** mätningen gjordes med den linjära responsen och de snabbare
+> hastigheterna som gällde före känslofixen (T7 i
+> [TESTRESULTAT.md](TESTRESULTAT.md), 2026-09-18). Vilken axel som gör vad, och
+> åt vilket håll, är oförändrat och är hela poängen med det här dokumentet.
+> Beloppen räknas numera med `orbit_speed` 1,5708, `zoom_speed` 0,6931 och en
+> kvadratisk responskurva, så samma råa counts ger ett mindre utslag.
+> Överhörningen i tabell 1 är dessutom inte längre något kameran ser: daemonen
+> gallrar den innan add-inet får den.
+
 ---
 
 ## 1. Fysiskt facit: rörelse till axel
