@@ -3,7 +3,7 @@
 Maskin: vanessa, Arch (Omarchy 4.x), Hyprland pa Wayland, GTX 1080 Ti.
 spacenavd 1.3.1-1, libspnav 1.2-1, Fusion 2705.1.15 i Wine-prefixet
 `~/.autodesk_fusion/wineprefixes/default`, patchad wine ur `~/fusion-wine-build`.
-Datum: 2026-09-11.
+Datum: 2026-09-11 (T1 till T5) och 2026-09-18 (T6a).
 
 Alla siffror nedan ar uppmatta, inte uppskattade.
 
@@ -336,6 +336,108 @@ plockades upp inom en sekund utan omstart av vare sig daemon eller Fusion
 
 ---
 
+## T6a: axelmatris, mappning och rotationspunkt (2026-09-18)
+
+**Utfall: godkant.** Passet gjorde fyra saker, alla mot en korande Fusion med
+dokumentet `Latency_tester_assembly_v8` oppet.
+
+### Axelmatrisen
+
+Fixturen `tests/fixtures/axis_matrix.bin` (tolv enaxelburstar, 115 counts i 0,5 s
+per burst, alltsa det normaliserade integralet 0,1498) matades genom daemonen i
+`--replay --replay-wait`-lage. Add-inet loggar sedan detta passet en rad fore och
+en rad efter varje rorelse pa nivan `debug`, sa varje axels kamerasvar gar att
+lasa av exakt. Hela tabellen med belopp och harledningar ligger i
+[AXELMATRIS.md](AXELMATRIS.md). Kortversionen:
+
+| Axel | Kamerasvar vid input 0,1498 |
+| --- | --- |
+| `x` | panorering 1,287 cm i sidled |
+| `y` | panorering 1,286 cm i hojdled |
+| `z` | zoom, `viewExtents` ganger 0,8354 |
+| `rx` | pitch 21,46 grader, radien orord |
+| `ry` | yaw 21,46 grader kring world-Z |
+| `rz` | ingenting, `roll_speed` ar 0,0 (med 0,5: roll 4,29 grader) |
+
+Beloppen stammer exakt mot formlerna: `input * pan_speed * synlig bredd`,
+`exp(-input * zoom_speed)` och `input * orbit_speed`.
+
+### Fysiskt facit och den nya mappningen
+
+En ra spacenavd-inspelning med handen pa pucken ligger nu i repot som
+`tests/fixtures/hardware/calibration_capture.bin` (2004 rutor, 42 s, toppar pa
+350 counts). Den ger facit: hoger ar `x+`, framat ar `z+`, lyft ar `y+`,
+framkanten ner ar `rx-`, medurs sett uppifran ar `ry-`, FIT-knappen ar nummer 5.
+
+Mappningen `pan_x: x`, `pan_y: z`, `dolly: y` med `invert.dolly` och `invert.yaw`
+sanna verifierades genom att spela upp de fem riktiga rorelserna mot Fusion:
+
+| Rorelse | Uppmatt | Utfall |
+| --- | --- | --- |
+| skjut hoger | kameran 5,17 cm at vanster | modellen at hoger, ratt |
+| skjut framat | kameran 5,05 cm nedat | modellen uppat, ratt |
+| lyft | `viewExtents` ganger 1,269 | zoom ut, ratt |
+| tilta framkanten ner | elevation +26,64 grader | modellens framkant ner, ratt |
+| vrid medurs | +26,21 grader moturs kring world-Z | modellen medurs, ratt |
+
+### Autocentrerad rotationspunkt
+
+Med `orbit_pivot: "auto"` loggade varje burst `pivot=model`, och under de tva
+rotationsburstarna flyttade sig kamerans target 1,94 respektive 2,99 cm. Target
+kan bara rora sig om orbiten gar kring nagot annat an target, alltsa kring
+modellens boundingbox-centrum. Uppslaget kostade 1 ms per rorelse.
+
+### Kalibreringsverktyget
+
+`tools/calibrate.py` kort over samma inspelning (`--replay`) hittar de fem
+rorelserna, plockar ratt axel och tecken i alla fem, laser av knapp 5, och
+producerar exakt den mappning som repot nu skeppar. Det ar en oberoende
+harledning av samma svar som matrisen gav for hand.
+
+```
+5 movements found in calibration_capture.bin
+  pan_x  x      +      peak  +350  ratio   5.5  ok
+  pan_y  z      +      peak  +350  ratio  22.1  ok
+  dolly  y      +      peak  +350  ratio   4.8  ok
+  pitch  rx     -      peak  -350  ratio  16.8  ok
+  yaw    ry     -      peak  -350  ratio  23.9  ok
+  fit    button 5 (3 presses seen)
+```
+
+`tests/test_calibrate.py`: 37 av 37 kontroller grona, varav elva mot den riktiga
+inspelningen. `tests/test_camera_math.py` vaxte fran 25 till 42 kontroller med
+pivot- och burstlogiken inraknad, `tests/test_daemon.py` gar pa 26.
+
+### Tva fallgropar som kostade tid
+
+* **Fusion flyttar kameran sjalv** medan en assembly laddar. Forsta matningen
+  fick `dist` att hoppa fran 23,7 till 147,7 cm mitt i en burst, utan nagon
+  input. Matningen gjordes om nar dokumentet stod stilla.
+* **Uppspelning komprimerar pauser.** En ra inspelning innehaller inga rutor alls
+  medan pucken star stilla, sa hela hardvaruinspelningen blev en enda burst i
+  `--replay`. Rorelserna klipptes darfor isar med nollrutor emellan.
+
+---
+
+## T6b: fysisk slutverifiering (aterstar)
+
+**Utfall: inte kord.** Kvar att gora med handen pa pucken, i denna ordning:
+
+1. Kanns nagon riktning bakvand, flippa den flaggan: `invert.dolly` for zoom,
+   `invert.pitch` eller `invert.yaw` for rotationerna. En flagga i taget, och
+   `systemctl --user restart bifrost.service` emellan.
+2. Kanns kansligheten fel: `sensitivity` for allt, annars `orbit_speed`,
+   `pan_speed`, `zoom_speed` var for sig. Daemondelen laddas om utan omstart.
+3. Kryper vyn i vila trots `deadzone` 30, hoj till 40.
+4. Vill Elias bygga om mappningen fran grunden: `python3 tools/calibrate.py`.
+
+Det som bevisligen fungerar redan: hela kedjan fran ra spnav-data till kameran,
+med riktig hardvarudata inspelad fran pucken, och 30,0 kamerauppdateringar per
+sekund. Det som inte gar att veta forran handen ar pa pucken ar om
+kanslighetskurvan och teckenvalen kanns ratt i praktiken.
+
+---
+
 ## Sammanfattning
 
 | Test | Utfall | Nyckeltal |
@@ -345,16 +447,18 @@ plockades upp inom en sekund utan omstart av vare sig daemon eller Fusion
 | T3 add-in laddas | godkant | autostart headless via JSLoadedScriptsinfo, fyra starter i rad |
 | T4 kamerastyrning | godkant | 30,0 kamerauppdateringar/s, orbit utan drift, 2,13 rad/s |
 | T5 reconnect | godkant | ater ansluten 1 till 3 s efter att daemonen kom tillbaka |
+| T6a axelmatris, mappning, pivot | godkant | 12 burstar uppmatta, 5 hardvarurorelser verifierade, 105 kontroller i tre sviter |
+| T6b fysisk slutverifiering | aterstar | kanslighet och teckenval med handen pa pucken |
 
 ### Kanda begransningar
 
-* Live-capturen fran hardvaran blev bara tre rutor, eftersom pucken knappt rordes
-  under inspelningen. Full utslagning och knapptryckningar ar verifierade mot
-  kallkoden och mot syntetiska fixturer med samma ramformat, inte mot inspelad
-  hardvarudata.
-* Axelmappningen (vilken fysisk rorelse som ar `ry` respektive `rz`) ar inte
-  verifierad mot handen pa pucken. Det ar darfor `map` och `invert` ar
-  konfigurerbara. Slutverifieringen med handen pa SpaceMousen aterstar.
+* Live-capturen fran 2026-09-11 blev bara tre rutor. Det ar atgardat: T6a spelade
+  in 42 sekunder med fullt utslag pa fem axlar och tre knapptryck, och den
+  inspelningen ligger i repot som `tests/fixtures/hardware/`.
+* Axelmappningen ar sedan T6a uppmatt mot handen pa pucken for fem av sex
+  motioner. Rollen (`rz`) ar den enda vars fysiska riktning bara ar harledd, och
+  den ar avstangd (`roll_speed` 0,0). Zoomriktningen ar ett smakval, inte en
+  matning.
 * Skarmdumpar via kompositorn gar inte att anvanda sa lange skarmarna ar
   franokopplade. `Viewport.saveAsImageFile` fungerar aven da.
 * Taket 30 Hz ar add-inets `max_fire_hz`. Fusion klarade det genomgaende med
