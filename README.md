@@ -194,6 +194,9 @@ ever has to be edited.
 | `orbit_mode` | `turntable` | `turntable` keeps world up level, `free` is a true 6DoF orbit |
 | `orbit_pivot` | `auto` | `auto` turns around the model's centre, `target` around the camera target |
 | `idle_gap_seconds` | `0.5` | a pause this long ends one movement and starts the next |
+| `wake_main_loop` | `both` | poke Fusion's message loop after each fired event: `both`, `thread`, `window`, `off` |
+| `refresh_viewport` | `true` | ask Fusion to repaint after each camera update |
+| `stall_warn_seconds` | `0.5` | warn in the log when a fired event has gone this long unhandled |
 | `world_up` | `[0, 0, 1]` | up axis for turntable mode |
 | `pitch_limit_deg` | `1.0` | how close to the pole turntable pitch may get, so elevation is clamped to 89 degrees |
 | `min_distance` | `0.01` | closest a perspective camera may dolly to its target |
@@ -264,6 +267,34 @@ Set `exponent` to `1.0`, `dominant_group` to `false` and `smoothing_seconds` to
 `0` to get the raw stream back, which is what the plumbing tests use. All of it
 lives in the `daemon` section, so the file is re-read within a second and you
 can tune it with Fusion running.
+
+### Getting the camera update onto the screen
+
+Two things have to happen for a puck movement to become a picture, and neither
+is guaranteed by the one before it.
+
+**The event has to run.** `fireCustomEvent` puts the event on Fusion's main loop
+queue from the reader thread. It does not make that loop run. A Qt loop with
+nothing to do blocks waiting for a window message, and a SpaceMouse produces
+none: the data arrives over TCP into a background thread, the mouse never moves,
+no key is pressed. If that ever happens the events pile up and the first handler
+out of the gate takes the whole accumulated delta at once. So the add-in posts a
+`WM_NULL`, the message that means nothing, to the main thread and to Fusion's top
+level window after every fire. That is exactly what the loop is blocking on, and
+`DefWindowProc` drops the message itself. `wake_main_loop` turns it off or picks
+one of the two routes.
+
+Measured on this machine, the loop does **not** in fact sleep: with Fusion on a
+hidden workspace, unfocused, and 47 seconds of recorded SpaceMouse data going in,
+the worst fire to handler latency was 11 ms and the camera ran at 30 Hz with
+`wake_main_loop` set to `off`. The posts stay on anyway. They cost two syscalls
+per frame and they make the failure mode impossible rather than merely unobserved.
+
+**The result has to be drawn.** Writing `viewport.camera` changes where the
+camera is. Fusion still has to repaint to show it. `refresh_viewport` asks it to,
+after every camera update. If the picture ever lags behind the puck and then
+catches up the moment you touch the mouse, this is the flag that matters, not the
+one above: the log will show the camera moving at 30 Hz the whole time.
 
 ### The turntable
 

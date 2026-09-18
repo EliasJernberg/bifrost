@@ -3,7 +3,7 @@
 Maskin: vanessa, Arch (Omarchy 4.x), Hyprland pa Wayland, GTX 1080 Ti.
 spacenavd 1.3.1-1, libspnav 1.2-1, Fusion 2705.1.15 i Wine-prefixet
 `~/.autodesk_fusion/wineprefixes/default`, patchad wine ur `~/fusion-wine-build`.
-Datum: 2026-09-11 (T1 till T5) och 2026-09-18 (T6a, T6b och T7).
+Datum: 2026-09-11 (T1 till T5) och 2026-09-18 (T6a, T6b, T7 och T8).
 
 Alla siffror nedan ar uppmatta, inte uppskattade.
 
@@ -708,6 +708,140 @@ viewporten byter form.
 
 ---
 
+## T8: kon som inte fanns (2026-09-18)
+
+**Utfall: hypotesen falsifierad, men atgarderna skeppas anda.**
+
+### Hypotesen
+
+Elias beskrev symtomet: nar han rorde pucken hande ingenting, och nar han sedan
+rorde modellen med musen kom alla puckrorelser pa en gang, som en ko som
+flushades. Foreslagen mekanism: `fireCustomEvent` lagger bara eventet i Fusions
+huvudloopko, och en Qt-loop utan nagot att gora blockerar i vantan pa ett
+fonstermeddelande. En SpaceMouse producerar inget sadant: datan kommer over TCP
+in i en bakgrundstrad, musen ror sig inte, ingen tangent trycks. Kon skulle da
+vaxa, och forsta handleraren ut ur startblocken skulle ta hela det ackumulerade
+deltat.
+
+Det skulle forklara 143 grader per sekund, `d_eye` pa 100 cm och monstret "0,3 Hz
+och sedan 29 Hz" i loggen.
+
+### Vad matningen sager
+
+Add-inet mater nu koen sjalv. Pacertraden noterar hur lange ett avfyrat event
+varit ohanterat och varnar over `stall_warn_seconds`; handleraren mater tiden
+fran `fireCustomEvent` till att den kordes, och varje burst bar sitt varsta varde
+som `lat_max` i `burst end`-raden.
+
+Provet kordes i det hardaste tillgangliga laget: Fusion pa workspace 5, **inte**
+synligt, **inte** fokuserat, ingen muspekare i narheten, ingen tangent rord, och
+47 sekunder av Elias egen inspelning matad genom daemonen. Om loopen nagonsin
+sover ar det da.
+
+| `wake_main_loop` | `refresh_viewport` | stalls | varsta stall | varsta latens i en burst | kamerauppdateringar |
+| --- | --- | --- | --- | --- | --- |
+| `off` | `false` | 1 | 0,56 s | **0,010 s** | 326 pa 17 s |
+| `off` | `true` | 1 | 0,56 s | **0,012 s** | 322 pa 17 s |
+| `both` | `false` | 1 | 0,57 s | **0,010 s** | 328 pa 17 s |
+| `both` | `true` | 1 | 0,56 s | **0,011 s** | 325 pa 17 s |
+
+Matrisen ar platt. Slutsatserna:
+
+* **Kon stallar inte under rorelse.** Varsta tiden fran `fireCustomEvent` till
+  handleraren ar 10 till 12 millisekunder, i alla fyra konfigurationerna och i
+  fem korningar. En ko som samlar pa sig sekunder av input finns inte.
+* **Den enda stallen ar alltid densamma:** forsta eventet efter att daemonen
+  anslutit, cirka 0,56 s, identisk med vackningen av och pa. Det ar Fusion som
+  ar upptagen precis efter en anslutning, inte en sovande meddelandeloop. Den
+  aterkommer aldrig under pagaende rorelse.
+* **`viewport.refresh()` kostar ingenting.** 322 till 328 kamerauppdateringar pa
+  17 sekunder oavsett. En tidigare matning som sag ut som en halvering visade sig
+  vara en annan zoomniva med mer geometri pa skarmen, inte omritningen.
+
+### Vad "0,0 Hz" i den gamla loggen faktiskt var
+
+Raden som hypotesen vilade pa:
+
+```
+14:14:14 INFO  camera update rate: 0.0 Hz (14 sets in 623.74 s)
+15:15:18 INFO  camera update rate: 0.3 Hz (6 sets in 20.46 s)
+```
+
+Det ar inte en stall. Det ar min egen mataremetod: rutan for takten oppnades vid
+forra rorelsen och `apply()` returnerar tidigt nar det inte finns nagot att gora,
+sa fonstret lag kvar over hela pausen. "14 sets in 623.74 s" betyder att Elias
+inte rorde pucken pa tio minuter. Under sjalva rorelserna i det passet star det
+23 till 30 Hz rakt igenom.
+
+Mataren ar rattad: takten nollstalls nar en rorelse tar slut, sa siffran mater
+kamerauppdateringar per sekund medan pucken anvands, inte medan den ligger stilla.
+
+### Vad som skeppas anda, och varfor
+
+**`wake_main_loop`** postar `WM_NULL`, meddelandet som betyder ingenting, till
+huvudtraden och till Fusions toppfonster efter varje avfyrat event. Add-inet
+plockar traad-id och HWND i `run()`, som Fusion kallar pa huvudtraden
+(`wake: main thread 36, window 0x300e6` i loggen). Det ar exakt det en blockerad
+Qt-loop vantar pa, och `DefWindowProc` slanger meddelandet.
+
+Det gjorde **ingen matbar skillnad har**, vilket tabellen visar. Det skeppas anda
+pa `both`: tva systemanrop per bildruta kostar inget, `WM_NULL` kan inte gora
+nagot, och det gor felmoden omojlig i stallet for bara obserad. Satt till `off`
+om det nagonsin ska uteslutas.
+
+**`refresh_viewport`** ber Fusion rita om efter varje kameraandring. Att skriva
+`viewport.camera` flyttar kameran; att visa resultatet ar en annan sak. Det ar
+den enda av de tva atgarderna som adresserar det Elias faktiskt beskrev, en bild
+som star still medan kameran ror sig, och den ar gratis. Darfor pa som standard.
+
+### Sviterna
+
+`tests/test_camera_math.py` gick fran 72 till 75 kontroller: omritningen har egna
+tester, bade att en kameraandring ber om den, att en tom bildruta inte gor det
+och att `refresh_viewport: false` fortfarande flyttar kameran. Totalt **156
+kontroller, alla grona** (75 + 44 + 37).
+
+### Kinematiken haller
+
+Samma inspelning genom samma kedja med bada atgarderna pa, 14 burstar:
+rullfelet hogst **3,33e-16**, panoreringen fortfarande exakt mot den live matta
+bredden (8,8708 cm forvantat, 8,8702 uppmatt), zoomburstarna ror inte `eye` och
+rotationsburstarna ror inte `viewExtents`. Allt T7 matte galler oforandrat med
+omritningen inkopplad.
+
+### Overhorningsskyddet och kurvan behovs fortfarande
+
+Punkten var vard att stalla: om kon hade varit orsaken skulle gallringen och
+kurvan kunna backas. Den var det inte. Overhorningen sitter i hardvaran och ar
+uppmatt i raa counts i inspelningen: att lyfta pucken ger upp till 105 counts pa
+`rz`, att skjuta at hoger ger 42 pa `z`. Den finns dar oavsett hur snabbt
+kameran uppdateras. Bada lamnas pa i full styrka.
+
+### Kvar: det fokuserade fallet, for Elias
+
+Matningen ovan ar gjord med Fusion ofokuserat, vilket ar det harda fallet: ett
+ofokuserat fonster pa en dold workspace far farre fonstermeddelanden an ett
+fokuserat, aldrig fler. Ett fokuserat prov kan darfor inte visa en stall som det
+ofokuserade inte visar, och det kraver att fokus tas fran det Elias jobbar i.
+Det kordes darfor inte.
+
+Vill Elias anda se siffrorna med Fusion i fokus:
+
+```bash
+# 1. debuglogg pa
+#    addin.log_level = "debug" i ~/.config/bifrost/config.json
+systemctl --user restart bifrost.service
+# 2. klicka i Fusion, slapp musen, ror bara pucken i tio sekunder
+# 3. las av
+grep -E "lat_max|main loop is" ~/.autodesk_fusion/wineprefixes/default/drive_c/users/$USER/AppData/Local/Temp/bifrost.log | tail
+```
+
+`lat_max` over nagra hundradelar, eller rader om "main loop is asleep", betyder
+att kon stallar i hans lage. Under 0,02 gor den inte det, och da ar det
+omritningen (`refresh_viewport`) och inte koen som avgor vad han ser.
+
+---
+
 ## T6b: fysisk slutverifiering (kord, underkand, atgardad i T7)
 
 **Utfall: underkant.** Elias korde passet 2026-09-18 runt 14:14 med handen pa
@@ -747,6 +881,7 @@ polgransen.
 | T6a axelmatris, mappning, pivot | godkant | 12 burstar uppmatta, 5 hardvarurorelser verifierade, 105 kontroller i tre sviter |
 | T6b fysisk slutverifiering | underkant | overhorning, 143 grader/s och polgransen 2 grader |
 | T7 kanslofixen | godkant | rullfel under 3,1e-16 i 24 burstar mot Fusion, panorering pa fem vardesiffror, 0 och 360 grader bitidentiska |
+| T8 kon som inte fanns | hypotes falsifierad | 10 till 12 ms fran fireCustomEvent till handlerare i alla fyra konfigurationer, ofokuserat och dolt |
 
 ### Kanda begransningar
 
@@ -766,3 +901,8 @@ polgransen.
   per sekund och exponent 2,0 ar ratt siffror for handen gar bara att avgora av
   handen. Se listan i T6b.
 * Zoomriktningen ar fortfarande ett smakval: `addin.invert.dolly`.
+* T8 mattes bara med Fusion ofokuserat. Det ar det harda fallet, men
+  manuella steg for det fokuserade finns sist i T8 om Elias vill se dem.
+* `refresh_viewport` ar pa som standard och kostar ingen matbar takt, men om
+  bilden skulle slappa efter pucken ar det den flaggan som gor skillnad, inte
+  `wake_main_loop`.
