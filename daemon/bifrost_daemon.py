@@ -79,7 +79,7 @@ DEFAULTS = {
         "emit_hz": 60,
         "ping_seconds": 5.0,
         # Raw spacenavd counts below this are treated as zero.
-        "deadzone": 15,
+        "deadzone": 30,
         # Raw count that maps to a normalised magnitude of 1.0.
         "full_scale": 350,
         "sensitivity": 1.0,
@@ -98,21 +98,25 @@ DEFAULTS = {
     # hello frame, so camera tuning never needs a file inside the Wine prefix.
     "addin": {
         "max_fire_hz": 30,
-        # Which spacenavd axis drives which camera motion.
+        # Which spacenavd axis drives which camera motion. Measured against the
+        # hardware, see docs/AXELMATRIS.md: push right is x+, push away is z+,
+        # lift is y+, tilting the front edge down is rx-, twisting clockwise
+        # seen from above is ry-.
         "map": {
             "pan_x": "x",
-            "pan_y": "y",
-            "dolly": "z",
+            "pan_y": "z",
+            "dolly": "y",
             "pitch": "rx",
             "yaw": "ry",
             "roll": "rz",
         },
+        # Signs chosen so the model follows the puck on screen.
         "invert": {
             "pan_x": False,
-            "pan_y": True,
-            "dolly": False,
+            "pan_y": False,
+            "dolly": True,
             "pitch": False,
-            "yaw": False,
+            "yaw": True,
             "roll": False,
         },
         # Radians per unit of accumulated normalised input.
@@ -124,6 +128,12 @@ DEFAULTS = {
         "roll_speed": 0.0,
         # "free" orbits around the camera up vector, "turntable" around world_up.
         "orbit_mode": "turntable",
+        # "auto" turns around the centre of the visible model, "target" around
+        # the camera target, which is what every version before this did.
+        "orbit_pivot": "auto",
+        # A pause this long ends one movement and starts the next, which is when
+        # the auto pivot is allowed to move.
+        "idle_gap_seconds": 0.5,
         "world_up": [0.0, 0.0, 1.0],
         # Keep at least this many degrees between the view direction and world_up
         # in turntable mode.
@@ -135,6 +145,9 @@ DEFAULTS = {
         # Run a scripted 360 degree orbit right after the add-in starts.
         "selftest": False,
         "selftest_seconds": 3.0,
+        # Viewport widths of pan before the scripted orbit, so the rendered
+        # frames show whether the orbit still turns around the model.
+        "selftest_pan": 0.0,
         "selftest_wait_seconds": 600.0,
         "selftest_image_dir": "",
         "selftest_settle_seconds": 3.0,
@@ -270,10 +283,11 @@ class ClientHub(object):
 
 
 class Bridge(object):
-    def __init__(self, config, replay=None, replay_loop=False):
+    def __init__(self, config, replay=None, replay_loop=False, replay_wait=False):
         self.config = config
         self.replay = replay
         self.replay_loop = replay_loop
+        self.replay_wait = replay_wait
         self.hub = ClientHub()
         self.running = True
         self._state_lock = threading.Lock()
@@ -380,6 +394,18 @@ class Bridge(object):
             data = handle.read()
         count = len(data) // FRAME_SIZE
         log("replay: %s, %d frames" % (self.replay, count))
+        if self.replay_wait:
+            # Fusion's add-in reconnects with a backoff of up to five seconds,
+            # so without this the first bursts of a capture play to nobody.
+            deadline = time.monotonic() + 60.0
+            while self.running and self.hub.count() == 0:
+                if time.monotonic() > deadline:
+                    log("replay: no client after 60 s, playing anyway")
+                    break
+                time.sleep(0.25)
+            if self.hub.count():
+                log("replay: client is listening, starting in 1 s")
+                time.sleep(1.0)
         while self.running:
             for index in range(count):
                 if not self.running:
@@ -598,6 +624,11 @@ def main(argv=None):
         "--replay-loop", action="store_true", help="loop the replay file forever"
     )
     parser.add_argument(
+        "--replay-wait",
+        action="store_true",
+        help="hold the replay until a client (the Fusion add-in) has connected",
+    )
+    parser.add_argument(
         "--dump", action="store_true", help="decode spacenavd events to stdout and exit"
     )
     parser.add_argument(
@@ -621,7 +652,12 @@ def main(argv=None):
         return mode_tail(args)
 
     config = Config(args.config)
-    bridge = Bridge(config, replay=args.replay, replay_loop=args.replay_loop)
+    bridge = Bridge(
+        config,
+        replay=args.replay,
+        replay_loop=args.replay_loop,
+        replay_wait=args.replay_wait,
+    )
     bridge.start()
     log("started (config: %s)" % args.config)
     try:
