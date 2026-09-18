@@ -6,6 +6,11 @@
 # thread, inside a custom event handler, because the Fusion API is not thread
 # safe.
 #
+# The daemon has already done the shaping by the time anything arrives here:
+# deadzone, response curve, dominant group and smoothing. What is left in this
+# file is the camera itself, and the part that matters is the turntable, see the
+# block comment above basis_from_up.
+#
 # Tuning lives in ~/.config/bifrost/config.json on the Linux side and arrives in
 # the daemon's hello frame, so nothing inside the Wine prefix has to be edited.
 
@@ -41,23 +46,25 @@ DEFAULT_ADDIN_CONFIG = {
         "yaw": True,
         "roll": False,
     },
-    "orbit_speed": 2.5,
+    "orbit_speed": 1.5708,
     "pan_speed": 1.0,
-    "zoom_speed": 1.2,
+    "zoom_speed": 0.6931,
     "roll_speed": 0.0,
     "orbit_mode": "turntable",
     "orbit_pivot": "auto",
     "idle_gap_seconds": 0.5,
     "world_up": [0.0, 0.0, 1.0],
-    "pitch_limit_deg": 2.0,
+    "pitch_limit_deg": 1.0,
     "min_distance": 0.01,
     "fit_button": "first",
     "selftest": False,
     "selftest_seconds": 3.0,
     "selftest_pan": 0.0,
+    "selftest_zoom": 0.0,
+    "selftest_fit": True,
     "selftest_wait_seconds": 600.0,
     "selftest_image_dir": "",
-    "selftest_settle_seconds": 3.0,
+    "selftest_settle_seconds": 15.0,
     "log_path": "",
     "log_level": "info",
 }
@@ -165,6 +172,74 @@ def v_rotate(v, axis, angle):
     )
 
 
+# ------------------------------------------------------------- turntable ---
+#
+# A turntable view has exactly two degrees of freedom around its pivot: how far
+# round it has been turned (azimuth) and how far above or below the horizon the
+# camera sits (elevation). Everything else, the up vector included, follows from
+# those two and from world_up.
+#
+# The first version of this add-in instead rotated the live eye, target and up
+# vectors a little further every frame. That works on paper and drifts in
+# practice: the up vector it read back was whatever Fusion last stored, the
+# pitch axis was derived from that up vector, and any roll in it, from the view
+# cube, from a mouse orbit or from Fusion re-fitting the view, was permanent and
+# grew. Rebuilding from the angles instead cannot roll, cannot drift and makes
+# the pole limit mean something, because the elevation being clamped is the
+# actual number the camera is built from.
+
+
+def basis_from_up(world_up):
+    """A fixed right handed frame (f0, s0, up) to measure the angles in.
+
+    f0 and s0 span the horizontal plane, so azimuth 0 points along f0 and a
+    growing azimuth turns counterclockwise seen from world_up.
+    """
+    up = v_norm(world_up)
+    if up == (0.0, 0.0, 0.0):
+        up = (0.0, 0.0, 1.0)
+    seed = (1.0, 0.0, 0.0) if abs(up[0]) < 0.9 else (0.0, 1.0, 0.0)
+    s0 = v_norm(v_cross(up, seed))
+    f0 = v_cross(s0, up)
+    return f0, s0, up
+
+
+def turntable_frame(azimuth, elevation, basis):
+    """right, up and pivot-to-eye direction for one turntable pose.
+
+    right is horizontal by construction, which is what stops a pitch from
+    tumbling the view, and up leans with the elevation but never rolls.
+    """
+    f0, s0, world_up = basis
+    cos_a, sin_a = math.cos(azimuth), math.sin(azimuth)
+    cos_e, sin_e = math.cos(elevation), math.sin(elevation)
+    horizontal = v_add(v_scale(f0, cos_a), v_scale(s0, sin_a))
+    direction = v_add(v_scale(horizontal, cos_e), v_scale(world_up, sin_e))
+    up = v_add(v_scale(horizontal, -sin_e), v_scale(world_up, cos_e))
+    right = v_add(v_scale(f0, -sin_a), v_scale(s0, cos_a))
+    return right, up, direction
+
+
+def turntable_angles(direction, basis):
+    """Azimuth and elevation of a unit direction. Azimuth is None at the pole."""
+    f0, s0, world_up = basis
+    vertical = max(-1.0, min(1.0, v_dot(direction, world_up)))
+    elevation = math.asin(vertical)
+    horizontal = v_sub(direction, v_scale(world_up, vertical))
+    if v_len(horizontal) < 1e-9:
+        return None, elevation
+    return math.atan2(v_dot(horizontal, s0), v_dot(horizontal, f0)), elevation
+
+
+def roll_error(eye, target, up, world_up):
+    """How far the view is from level: 0 when up lies in the world_up plane."""
+    forward = v_norm(v_sub(target, eye))
+    right = v_norm(v_cross(forward, up))
+    if right == (0.0, 0.0, 0.0):
+        return 0.0
+    return abs(v_dot(right, v_norm(world_up)))
+
+
 # --------------------------------------------------------------- add-in ----
 
 
@@ -198,11 +273,21 @@ class BifrostState(object):
         self.pivot_valid = False
         self.pivot_source = "target"
 
+        # The turntable pose, in the world_up frame. Read off the camera when a
+        # burst opens, or whenever the camera turns out to have moved behind our
+        # back, and integrated from there. eye and up are rebuilt from these two
+        # numbers every frame, never accumulated on.
+        self.orbit_az = 0.0
+        self.orbit_el = 0.0
+        self.orbit_valid = False
+        self.last_written = None  # (eye, target) as we last set them
+
         self.custom_event = None
         self.handler = None
         self.threads = []
 
         self.fit_button = None
+        self.fit_requested = False
         self.camera_sets = 0
         self.fires = 0
         self.in_flight = False
@@ -210,7 +295,7 @@ class BifrostState(object):
         self.shot_queue = []
         self._rate_window_start = time.time()
         self._rate_window_sets = 0
-        self._logged_view_scale = False
+        self._logged_view_scale = None  # last viewport shape we logged
 
     # -- config --------------------------------------------------------
 
@@ -237,12 +322,16 @@ class BifrostState(object):
         else:
             self.fit_button = -1
         self.log.info(
-            "config applied: orbit=%s pan=%s zoom=%s mode=%s pivot=%s map=%s invert=%s"
+            "config applied: orbit=%s (%.0f deg/s) pan=%s zoom=%s (x%.2f/s) "
+            "mode=%s pitch_limit=%s pivot=%s map=%s invert=%s"
             % (
                 merged.get("orbit_speed"),
+                math.degrees(float(merged.get("orbit_speed", 0.0))),
                 merged.get("pan_speed"),
                 merged.get("zoom_speed"),
+                math.exp(float(merged.get("zoom_speed", 0.0))),
                 merged.get("orbit_mode"),
+                merged.get("pitch_limit_deg"),
                 merged.get("orbit_pivot"),
                 merged.get("map"),
                 merged.get("invert"),
@@ -415,6 +504,44 @@ class BifrostState(object):
             time.sleep(0.5)
         return False
 
+    def drain(self, timeout=10.0):
+        """Wait until everything queued has actually reached the camera.
+
+        The self test used to inject its movement on a wall clock and assume the
+        camera kept up. It does not: while an assembly is still settling the
+        event queue runs at a third of max_fire_hz, so the rendered frames were
+        taken at whatever angle happened to have been reached, and the last of
+        the orbit spilled into the next movement. Waiting for the accumulator to
+        empty makes the whole self test frame rate independent, which is what
+        the pictures in docs/ need to be worth anything.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline and self.running:
+            with self.lock:
+                idle = (
+                    self.extra_yaw == 0.0
+                    and not self.shot_queue
+                    and not self.fit_requested
+                    and not self.in_flight
+                    and all(abs(value) < 1e-12 for value in self.acc)
+                )
+            if idle:
+                # One more pass, so the camera set that drained the accumulator
+                # has been through Fusion's own redraw.
+                time.sleep(0.1)
+                return True
+            time.sleep(0.02)
+        self.log.warn("selftest: queue did not drain in %.1f s" % timeout)
+        return False
+
+    def inject(self, index, amount, chunks=10):
+        """Feed input in, as the daemon would, and wait for it to land."""
+        for _ in range(chunks):
+            with self.lock:
+                self.acc[index] += amount / float(chunks)
+                self.pending = True
+            self.drain()
+
     def selftest_loop(self):
         seconds = float(self.config.get("selftest_seconds", 3.0))
         timeout = float(self.config.get("selftest_wait_seconds", 600.0))
@@ -444,6 +571,28 @@ class BifrostState(object):
                 camera.cameraType == adsk.core.CameraTypes.OrthographicCameraType,
             )
         )
+        shot_dir = self.config.get("selftest_image_dir") or os.path.dirname(
+            self.log.path
+        )
+        if self.config.get("selftest_fit", True):
+            # Frame the model the same way every run, whatever view Fusion
+            # happened to restore, so the rendered frames are comparable
+            # between runs and the pan below cannot shove the model out of
+            # a view that started out zoomed too far out.
+            self.log.info("selftest: viewport.fit() first")
+            with self.lock:
+                self.fit_requested = True
+                self.pending = True
+            self.drain()
+            time.sleep(1.0)
+            camera = self.app.activeViewport.camera
+            self.log.info(
+                "selftest: after fit eye=(%.3f, %.3f, %.3f) extents=%.4f"
+                % (camera.eye.x, camera.eye.y, camera.eye.z, camera.viewExtents)
+            )
+        self.request_shot(os.path.join(shot_dir, "bifrost-selftest-start.png"))
+        self.drain()
+
         pan = float(self.config.get("selftest_pan", 0.0))
         if abs(pan) > 1e-9:
             # Shove the model off to one side first. With orbit_pivot "auto" the
@@ -456,12 +605,9 @@ class BifrostState(object):
             if self.config.get("invert", {}).get("pan_x", False):
                 amount = -amount
             self.log.info("selftest: panning %.2f viewport widths first" % pan)
-            for _ in range(20):
-                with self.lock:
-                    self.acc[index] += amount / 20.0
-                    self.pending = True
-                time.sleep(0.05)
-            time.sleep(1.0)
+            self.inject(index, amount)
+            self.request_shot(os.path.join(shot_dir, "bifrost-selftest-pan.png"))
+            self.drain()
             camera = self.app.activeViewport.camera
             self.log.info(
                 "selftest: after pan eye=(%.3f, %.3f, %.3f) target=(%.3f, %.3f, %.3f)"
@@ -476,24 +622,20 @@ class BifrostState(object):
             )
 
         self.log.info("selftest: scripted 360 degree orbit over %.1f s" % seconds)
-        steps = max(1, int(seconds * 30))
+        steps = max(4, int(seconds * 30) // 4 * 4)
         per_step = (2.0 * math.pi) / steps
-        shot_dir = self.config.get("selftest_image_dir") or os.path.dirname(
-            self.log.path
-        )
-        shot_at = dict(
-            (max(0, int(steps * fraction / 4.0) - 1), fraction)
-            for fraction in (1, 2, 3, 4)
-        )
+        shot_at = dict((steps * fraction // 4, fraction) for fraction in (1, 2, 3, 4))
         self.request_shot(os.path.join(shot_dir, "bifrost-selftest-0deg.png"))
+        self.drain()
         start = time.time()
         sets_before = self.camera_sets
-        for index in range(steps):
+        for index in range(1, steps + 1):
             if not self.running:
                 return
             with self.lock:
                 self.extra_yaw += per_step
                 self.pending = True
+            self.drain()
             if index in shot_at:
                 self.request_shot(
                     os.path.join(
@@ -501,8 +643,7 @@ class BifrostState(object):
                         "bifrost-selftest-%ddeg.png" % (shot_at[index] * 90),
                     )
                 )
-            time.sleep(seconds / steps)
-        time.sleep(0.5)
+                self.drain()
         elapsed = time.time() - start
         sets = self.camera_sets - sets_before
         camera = self.app.activeViewport.camera
@@ -526,6 +667,36 @@ class BifrostState(object):
             % (elapsed, sets, sets / elapsed if elapsed > 0 else 0.0)
         )
 
+        zoom = float(self.config.get("selftest_zoom", 0.0))
+        if abs(zoom) > 1e-9:
+            # Zoom in, render, zoom back out, render. Together with the pan and
+            # the orbit above that is one frame per motion, which is what the
+            # pictures in docs/ are there to show: the model stays upright
+            # through all three.
+            axis = self.config.get("map", {}).get("dolly")
+            index = AXES.index(axis) if axis in AXES else 0
+            speed = float(self.config.get("zoom_speed", 1.0)) or 1.0
+            amount = zoom / speed
+            if self.config.get("invert", {}).get("dolly", False):
+                amount = -amount
+            for direction, name in ((1.0, "zoom-in"), (-1.0, "zoom-out")):
+                self.log.info("selftest: %s by %.2f e-folds" % (name, zoom))
+                self.inject(index, direction * amount)
+                self.request_shot(
+                    os.path.join(shot_dir, "bifrost-selftest-%s.png" % name)
+                )
+                self.drain()
+            camera = self.app.activeViewport.camera
+            self.log.info(
+                "selftest: after zoom extents=%.4f up=(%.3f, %.3f, %.3f)"
+                % (
+                    camera.viewExtents,
+                    camera.upVector.x,
+                    camera.upVector.y,
+                    camera.upVector.z,
+                )
+            )
+
     # -- camera --------------------------------------------------------
 
     def view_scale(self, viewport, camera, distance):
@@ -544,8 +715,16 @@ class BifrostState(object):
                     v_sub((right.x, right.y, right.z), (left.x, left.y, left.z))
                 )
                 if span > 1e-9:
-                    if not self._logged_view_scale:
-                        self._logged_view_scale = True
+                    # Logged again whenever the viewport changes shape. It does:
+                    # opening a document brings up the timeline and the browser,
+                    # and the 3D view loses a couple of hundred pixels of height,
+                    # which changes how much world a pan of the same input
+                    # covers. Panning tracks it because the width is measured
+                    # live, but a picture taken before the change is no longer
+                    # comparable with one taken after.
+                    shape = (width, height)
+                    if shape != self._logged_view_scale:
+                        self._logged_view_scale = shape
                         self.log.info(
                             "view scale: viewport %dx%d, world width %.4f cm, "
                             "eye-target %.4f cm, viewExtents %.6f"
@@ -710,21 +889,123 @@ class BifrostState(object):
             self.pivot_valid = True
         return self.pivot, self.pivot_source
 
+    # -- turntable state -----------------------------------------------
+
+    def camera_moved_outside(self, eye, target):
+        """True if something other than this add-in moved the camera.
+
+        Fusion re-fits the view while a document loads, the mouse wheel sets
+        viewExtents and pushes the eye out to ten times it, and the view cube
+        and a mouse orbit move the camera outright. All of that has to reset the
+        turntable angles, or the next puck movement would snap the camera back
+        to where the add-in thought it was.
+        """
+        if self.last_written is None:
+            return True
+        scale = max(1.0, v_len(v_sub(eye, target)))
+        tolerance = 1e-4 * scale
+        return (
+            v_len(v_sub(eye, self.last_written[0])) > tolerance
+            or v_len(v_sub(target, self.last_written[1])) > tolerance
+        )
+
+    def sync_orbit(self, eye, pivot, basis):
+        """Read the current camera into azimuth and elevation."""
+        direction = v_norm(v_sub(eye, pivot))
+        if direction == (0.0, 0.0, 0.0):
+            return False
+        azimuth, elevation = turntable_angles(direction, basis)
+        if azimuth is None:
+            # Straight over the pole: the heading is undefined, so keep the one
+            # we had rather than inventing one.
+            azimuth = self.orbit_az
+        self.orbit_az = azimuth
+        self.orbit_el = elevation
+        self.orbit_valid = True
+        return True
+
+    def turntable_orbit(self, config, eye, target, pivot, yaw, pitch, fresh):
+        """Rebuild eye, target and up from the turntable angles plus the deltas.
+
+        The target keeps its offset from the pivot in camera coordinates, so it
+        turns with the view exactly as a rigid rotation around the pivot would,
+        which is what keeps a model that sits off target from sweeping across
+        the screen.
+        """
+        basis = basis_from_up(tuple(config.get("world_up", [0.0, 0.0, 1.0])))
+        radius = v_len(v_sub(eye, pivot))
+        if radius < 1e-9:
+            return eye, target, None
+        if fresh or not self.orbit_valid or self.camera_moved_outside(eye, target):
+            if not self.sync_orbit(eye, pivot, basis):
+                return eye, target, None
+
+        right, up, direction = turntable_frame(self.orbit_az, self.orbit_el, basis)
+        offset = v_sub(target, pivot)
+        in_camera = (
+            v_dot(offset, right),
+            v_dot(offset, up),
+            v_dot(offset, direction),
+        )
+
+        try:
+            margin = abs(float(config.get("pitch_limit_deg", 1.0)))
+        except (TypeError, ValueError):
+            margin = 1.0
+        limit = math.radians(max(0.0, min(90.0, 90.0 - margin)))
+        self.orbit_az += yaw
+        self.orbit_el = max(-limit, min(limit, self.orbit_el - pitch))
+
+        right, up, direction = turntable_frame(self.orbit_az, self.orbit_el, basis)
+        eye = v_add(pivot, v_scale(direction, radius))
+        target = v_add(
+            pivot,
+            v_add(
+                v_add(v_scale(right, in_camera[0]), v_scale(up, in_camera[1])),
+                v_scale(direction, in_camera[2]),
+            ),
+        )
+        return eye, target, up
+
     # -- bursts --------------------------------------------------------
 
     @staticmethod
     def fmt_vec(vector):
         return "(%.3f, %.3f, %.3f)" % (vector[0], vector[1], vector[2])
 
+    def pose(self, eye, target, up):
+        """Azimuth, elevation and roll error in degrees, for the debug log.
+
+        Roll error is the measurable that says whether the view is level: zero
+        means the camera's right vector is exactly horizontal, which is the
+        whole promise of turntable mode. A raw up vector cannot be read that
+        way, because the correct up leans with the elevation.
+        """
+        basis = basis_from_up(tuple(self.config.get("world_up", [0.0, 0.0, 1.0])))
+        direction = v_norm(v_sub(eye, target))
+        azimuth, elevation = turntable_angles(direction, basis)
+        if azimuth is None:
+            azimuth = 0.0
+        return (
+            math.degrees(azimuth),
+            math.degrees(elevation),
+            roll_error(eye, target, up, basis[2]),
+        )
+
     def open_burst(self, eye, target, up, extents, is_ortho):
         self.burst_start_cam = (eye, target, up, extents)
         self.pivot_valid = False
+        azimuth, elevation, roll = self.pose(eye, target, up)
         self.log.debug(
-            "burst start eye=%s target=%s up=%s dist=%.4f extents=%.4f ortho=%s"
+            "burst start eye=%s target=%s up=%s az=%+.2f el=%+.2f roll=%.2e "
+            "dist=%.4f extents=%.4f ortho=%s"
             % (
                 self.fmt_vec(eye),
                 self.fmt_vec(target),
                 self.fmt_vec(up),
+                azimuth,
+                elevation,
+                roll,
                 v_len(v_sub(eye, target)),
                 extents,
                 is_ortho,
@@ -750,17 +1031,33 @@ class BifrostState(object):
         except Exception as exc:
             self.log.debug("burst end: camera unreadable (%s)" % exc)
             return
+        azimuth, elevation, roll = self.pose(eye, target, up)
+        was_az, was_el, _was_roll = self.pose(start[0], start[1], start[2])
+        d_az = (azimuth - was_az + 180.0) % 360.0 - 180.0
+        # What panning was scaled against. Logged per burst because the viewport
+        # can change size under Fusion, and then a pan of the same input covers
+        # a different number of centimetres.
+        try:
+            span = self.view_scale(viewport, camera, v_len(v_sub(eye, target)))
+        except Exception:
+            span = 0.0
         self.log.debug(
-            "burst end   eye=%s target=%s up=%s dist=%.4f extents=%.4f "
-            "input=[%s] d_eye=%s d_target=%s d_dist=%+.4f d_extents=%+.4f "
-            "pivot=%s"
+            "burst end   eye=%s target=%s up=%s az=%+.2f el=%+.2f roll=%.2e "
+            "dist=%.4f extents=%.4f scale=%.4f input=[%s] d_az=%+.2f d_el=%+.2f "
+            "d_eye=%s d_target=%s d_dist=%+.4f d_extents=%+.4f pivot=%s"
             % (
                 self.fmt_vec(eye),
                 self.fmt_vec(target),
                 self.fmt_vec(up),
+                azimuth,
+                elevation,
+                roll,
                 v_len(v_sub(eye, target)),
                 extents,
+                span,
                 ", ".join("%s=%+.4f" % (AXES[i], burst_input[i]) for i in range(6)),
+                d_az,
+                elevation - was_el,
                 self.fmt_vec(v_sub(eye, start[0])),
                 self.fmt_vec(v_sub(target, start[1])),
                 v_len(v_sub(eye, target)) - v_len(v_sub(start[0], start[1])),
@@ -783,6 +1080,8 @@ class BifrostState(object):
                 self.pending = True
             closing = self.close_burst_requested
             self.close_burst_requested = False
+            fit_now = self.fit_requested
+            self.fit_requested = False
 
         config = self.config
         mapping = config.get("map", {})
@@ -810,7 +1109,7 @@ class BifrostState(object):
         dolly = pick("dolly") * zoom_speed
 
         moved = any(abs(v) > 1e-9 for v in (yaw, pitch, roll, pan_x, pan_y, dolly))
-        if not moved and not buttons and not shots and not closing:
+        if not moved and not buttons and not shots and not closing and not fit_now:
             return
 
         try:
@@ -826,6 +1125,13 @@ class BifrostState(object):
 
         if closing and not moved:
             self.close_burst(viewport)
+
+        if fit_now:
+            try:
+                viewport.fit()
+                self.log.debug("selftest: viewport.fit() done")
+            except Exception as exc:
+                self.log.warn("selftest fit failed: %s" % exc)
 
         if buttons:
             for bnum, pressed in buttons:
@@ -873,66 +1179,67 @@ class BifrostState(object):
         if fresh:
             self.open_burst(eye, target, up, camera.viewExtents, is_ortho)
 
+        turntable = config.get("orbit_mode", "turntable") == "turntable"
+        world_up = v_norm(tuple(config.get("world_up", [0.0, 0.0, 1.0])))
+        if turntable:
+            # A turntable view is level by definition, so there is nothing for
+            # the roll motion to do. orbit_mode "free" gives it back.
+            roll = 0.0
+
         forward = v_norm(v_scale(offset, -1.0))
         right = v_norm(v_cross(forward, up))
         if right == (0.0, 0.0, 0.0):
             right = (1.0, 0.0, 0.0)
         up = v_norm(v_cross(right, forward))
 
-        # Orbit. Pitch always turns around the camera's right vector. Yaw turns
-        # around the world up axis in turntable mode, around the camera up
-        # vector in free mode. Both turn eye and target around the pivot, which
-        # is the camera target in "target" mode and the centre of the model in
-        # "auto" mode, so the model stays put even when it sits off target.
+        # Orbit around the pivot, which is the camera target in "target" mode
+        # and the centre of the visible model in "auto" mode, so the model stays
+        # put even when it sits off target.
+        orbiting = abs(yaw) > 1e-9 or abs(pitch) > 1e-9
         pivot = target
-        if abs(yaw) > 1e-9 or abs(pitch) > 1e-9:
+        if orbiting:
             pivot, _source = self.resolve_pivot(target)
-        eye_off = v_sub(eye, pivot)
-        target_off = v_sub(target, pivot)
 
-        if abs(pitch) > 1e-9:
-            new_eye_off = v_rotate(eye_off, right, pitch)
-            new_target_off = v_rotate(target_off, right, pitch)
-            new_up = v_rotate(up, right, pitch)
-            if config.get("orbit_mode", "turntable") == "turntable":
-                world_up = v_norm(tuple(config.get("world_up", [0.0, 0.0, 1.0])))
-                limit = math.radians(float(config.get("pitch_limit_deg", 2.0)))
-                angle = math.acos(
-                    max(
-                        -1.0,
-                        min(
-                            1.0,
-                            v_dot(v_norm(v_sub(new_eye_off, new_target_off)), world_up),
-                        ),
-                    )
-                )
-                if angle < limit or angle > math.pi - limit:
-                    new_eye_off = eye_off
-                    new_target_off = target_off
-                    new_up = up
-            eye_off = new_eye_off
-            target_off = new_target_off
-            up = new_up
-
-        if abs(yaw) > 1e-9:
-            if config.get("orbit_mode", "turntable") == "turntable":
-                yaw_axis = v_norm(tuple(config.get("world_up", [0.0, 0.0, 1.0])))
-            else:
-                yaw_axis = up
-            eye_off = v_rotate(eye_off, yaw_axis, yaw)
-            target_off = v_rotate(target_off, yaw_axis, yaw)
-            up = v_rotate(up, yaw_axis, yaw)
-
-        eye = v_add(pivot, eye_off)
-        target = v_add(pivot, target_off)
-        offset = v_sub(eye, target)
+        if orbiting and turntable:
+            # Rebuilt from azimuth and elevation, never accumulated on.
+            eye, target, rebuilt_up = self.turntable_orbit(
+                config, eye, target, pivot, yaw, pitch, fresh
+            )
+            if rebuilt_up is not None:
+                up = rebuilt_up
+            offset = v_sub(eye, target)
+        elif orbiting:
+            # Free mode: a true trackball, pitch around the camera's right
+            # vector and yaw around its own up vector, roll and all.
+            eye_off = v_sub(eye, pivot)
+            target_off = v_sub(target, pivot)
+            if abs(pitch) > 1e-9:
+                eye_off = v_rotate(eye_off, right, pitch)
+                target_off = v_rotate(target_off, right, pitch)
+                up = v_rotate(up, right, pitch)
+            if abs(yaw) > 1e-9:
+                eye_off = v_rotate(eye_off, up, yaw)
+                target_off = v_rotate(target_off, up, yaw)
+            eye = v_add(pivot, eye_off)
+            target = v_add(pivot, target_off)
+            offset = v_sub(eye, target)
 
         if abs(roll) > 1e-9:
             forward = v_norm(v_scale(offset, -1.0))
             up = v_rotate(up, forward, roll)
 
         forward = v_norm(v_scale(offset, -1.0))
+        if turntable and orbiting:
+            # The exact level up for the direction the camera actually looks
+            # in, which is not quite the pivot-to-eye direction when the target
+            # sits off the pivot. This is the one line that makes the roll error
+            # identically zero rather than merely small.
+            levelled = v_sub(world_up, v_scale(forward, v_dot(forward, world_up)))
+            if v_len(levelled) > 1e-9:
+                up = v_norm(levelled)
         right = v_norm(v_cross(forward, up))
+        if right == (0.0, 0.0, 0.0):
+            right = (1.0, 0.0, 0.0)
         up = v_norm(v_cross(right, forward))
         distance = v_len(offset)
 
@@ -955,6 +1262,11 @@ class BifrostState(object):
                 new_distance = max(distance * factor, min_distance)
                 offset = v_scale(v_norm(offset), new_distance)
                 distance = new_distance
+                # A perspective dolly slides the eye along the view axis, which
+                # moves it off the turntable sphere when the pivot is not the
+                # target. Re-read the angles next frame rather than snapping
+                # back to the old ones.
+                self.orbit_valid = False
 
         eye = v_add(target, offset)
 
@@ -978,6 +1290,7 @@ class BifrostState(object):
             viewport.camera = camera
             self.camera_sets += 1
             self._rate_window_sets += 1
+            self.last_written = (eye, target)
         except Exception as exc:
             self.log.warn("camera update rejected: %s" % exc)
             return
