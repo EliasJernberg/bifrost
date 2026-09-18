@@ -53,6 +53,9 @@ DEFAULT_ADDIN_CONFIG = {
     "orbit_mode": "turntable",
     "orbit_pivot": "auto",
     "idle_gap_seconds": 0.5,
+    "wake_main_loop": "both",
+    "refresh_viewport": True,
+    "stall_warn_seconds": 0.5,
     "world_up": [0.0, 0.0, 1.0],
     "pitch_limit_deg": 1.0,
     "min_distance": 0.01,
@@ -240,6 +243,153 @@ def roll_error(eye, target, up, world_up):
     return abs(v_dot(right, v_norm(world_up)))
 
 
+# ------------------------------------------------------- waking Fusion ---
+#
+# fireCustomEvent only puts the event on Fusion's main loop queue. It does not
+# make that loop run. Fusion is a Qt application, and a Qt event loop with
+# nothing to do blocks in MsgWaitForMultipleObjectsEx waiting for a window
+# message. Nothing about a SpaceMouse produces one: the daemon talks TCP to a
+# background thread in this process, the mouse never moves, no key is pressed.
+#
+# So the events queue up, the camera does not move, and the moment anything at
+# all wakes the loop, a mouse move over the window, a wheel click, a repaint,
+# the whole queue drains at once. The first handler out of the gate takes the
+# entire accumulated delta and throws the camera across the model. That is what
+# "nothing happens, then everything happens" was.
+#
+# The fix is one line of Win32 per fired event: post a message, which is exactly
+# what the loop is blocking on. WM_NULL is the message that means nothing, so
+# DefWindowProc drops it and the only effect is that the loop wakes up, notices
+# Fusion's own queued custom event and runs it.
+
+WM_NULL = 0x0000
+
+
+class MainLoopWaker(object):
+    """Pokes Fusion's message loop so a queued custom event is actually run.
+
+    Two ways in, because which one a Qt loop under Wine listens to is not
+    something to guess at:
+
+    * a thread message to the main thread, which wakes GetMessage and
+      MsgWaitForMultipleObjects but is not tied to any window, and
+    * a window message to Fusion's own top level window.
+
+    Both are posted by default. Neither does anything except wake the loop.
+    """
+
+    def __init__(self, log):
+        self.log = log
+        self.ready = False
+        self.thread_id = None
+        self.hwnd = None
+        self.user32 = None
+        self.posts = 0
+        self.failures = 0
+
+    def prepare(self):
+        """Call this on Fusion's main thread, from run()."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception as exc:
+            self.log.warn("wake: ctypes unavailable (%s), cannot wake the loop" % exc)
+            return False
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+        except Exception as exc:
+            self.log.warn("wake: no Win32 libraries (%s)" % exc)
+            return False
+
+        try:
+            self.thread_id = int(kernel32.GetCurrentThreadId())
+            pid = int(kernel32.GetCurrentProcessId())
+        except Exception as exc:
+            self.log.warn("wake: GetCurrentThreadId failed (%s)" % exc)
+            return False
+
+        user32.PostThreadMessageW.argtypes = [
+            wintypes.DWORD,
+            wintypes.UINT,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        user32.PostThreadMessageW.restype = wintypes.BOOL
+        user32.PostMessageW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        user32.PostMessageW.restype = wintypes.BOOL
+        self.user32 = user32
+        self.hwnd = self._find_window(ctypes, wintypes, user32, pid)
+        self.ready = True
+        self.log.info(
+            "wake: main thread %d, window %s"
+            % (self.thread_id, hex(self.hwnd) if self.hwnd else "none found")
+        )
+        return True
+
+    def _find_window(self, ctypes, wintypes, user32, pid):
+        """Fusion's top level window on the main thread, or None."""
+        try:
+            proc_type = ctypes.WINFUNCTYPE(
+                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+            )
+            user32.EnumWindows.argtypes = [proc_type, wintypes.LPARAM]
+            user32.GetWindowThreadProcessId.argtypes = [
+                wintypes.HWND,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+            best = []
+
+            def visit(hwnd, _lparam):
+                owner = wintypes.DWORD()
+                tid = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+                if owner.value == pid and tid == self.thread_id:
+                    visible = bool(user32.IsWindowVisible(hwnd))
+                    titled = user32.GetWindowTextLengthW(hwnd) > 0
+                    best.append((visible, titled, hwnd))
+                return True
+
+            user32.EnumWindows(proc_type(visit), 0)
+            if not best:
+                return None
+            # A visible window with a title first, anything on the main thread
+            # after that: WM_NULL is harmless wherever it lands.
+            best.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            return best[0][2]
+        except Exception as exc:
+            self.log.debug("wake: EnumWindows failed (%s)" % exc)
+            return None
+
+    def wake(self, method="both"):
+        """Post the do-nothing message. Safe to call from any thread."""
+        if not self.ready or method == "off":
+            return False
+        posted = False
+        try:
+            if method in ("both", "thread") and self.thread_id:
+                if self.user32.PostThreadMessageW(self.thread_id, WM_NULL, None, None):
+                    posted = True
+            if method in ("both", "window") and self.hwnd:
+                if self.user32.PostMessageW(self.hwnd, WM_NULL, None, None):
+                    posted = True
+        except Exception as exc:
+            self.failures += 1
+            if self.failures <= 3:
+                self.log.warn("wake: post failed (%s)" % exc)
+            return False
+        if posted:
+            self.posts += 1
+        else:
+            self.failures += 1
+        return posted
+
+
 # --------------------------------------------------------------- add-in ----
 
 
@@ -285,6 +435,12 @@ class BifrostState(object):
         self.custom_event = None
         self.handler = None
         self.threads = []
+
+        self.waker = None
+        self.stalls = 0  # fires that took longer than stall_warn_seconds
+        self.max_latency = 0.0  # worst fire to handler latency this burst
+        self.last_latency = 0.0
+        self._stall_logged = False
 
         self.fit_button = None
         self.fit_requested = False
@@ -434,7 +590,12 @@ class BifrostState(object):
             hz = float(self.config.get("max_fire_hz", 30)) or 30.0
             period = 1.0 / hz
             idle_gap = float(self.config.get("idle_gap_seconds", 0.5))
+            try:
+                warn_after = float(self.config.get("stall_warn_seconds", 0.5))
+            except (TypeError, ValueError):
+                warn_after = 0.5
             fire = False
+            stalled = 0.0
             with self.lock:
                 # A burst that has gone quiet needs one more trip through the
                 # main thread to read the camera it ended on.
@@ -451,7 +612,13 @@ class BifrostState(object):
                     self.pending = False
                     self.in_flight = True
                     self.fired_at = time.time()
+                    self._stall_logged = False
                     fire = True
+                elif self.in_flight:
+                    waiting = time.time() - self.fired_at
+                    if waiting >= warn_after and not self._stall_logged:
+                        self._stall_logged = True
+                        stalled = waiting
             if fire:
                 try:
                     self.app.fireCustomEvent(CUSTOM_EVENT_ID, "")
@@ -460,6 +627,19 @@ class BifrostState(object):
                     with self.lock:
                         self.in_flight = False
                     self.log.error("fireCustomEvent failed: %s" % exc)
+                else:
+                    # Queueing the event is not the same as running it. See the
+                    # MainLoopWaker block comment: without this the loop sleeps
+                    # until some unrelated window message arrives.
+                    if self.waker is not None:
+                        self.waker.wake(self.config.get("wake_main_loop", "both"))
+            if stalled:
+                self.stalls += 1
+                self.log.warn(
+                    "custom event unhandled for %.2f s: Fusion's main loop is "
+                    "asleep (wake_main_loop=%s)"
+                    % (stalled, self.config.get("wake_main_loop", "both"))
+                )
             time.sleep(period)
 
     # -- self test -----------------------------------------------------
@@ -1017,6 +1197,11 @@ class BifrostState(object):
         start = self.burst_start_cam
         self.burst_open = False
         self.burst_start_cam = None
+        # Start the rate window over. It measures camera updates per second
+        # while the puck is being used; letting it run across the pause until
+        # the next movement turns an idle minute into a headline "0.0 Hz".
+        self._rate_window_start = time.time()
+        self._rate_window_sets = 0
         with self.lock:
             burst_input = list(self.burst_input)
             self.burst_input = [0.0] * 6
@@ -1044,7 +1229,8 @@ class BifrostState(object):
         self.log.debug(
             "burst end   eye=%s target=%s up=%s az=%+.2f el=%+.2f roll=%.2e "
             "dist=%.4f extents=%.4f scale=%.4f input=[%s] d_az=%+.2f d_el=%+.2f "
-            "d_eye=%s d_target=%s d_dist=%+.4f d_extents=%+.4f pivot=%s"
+            "d_eye=%s d_target=%s d_dist=%+.4f d_extents=%+.4f pivot=%s "
+            "lat_max=%.3f"
             % (
                 self.fmt_vec(eye),
                 self.fmt_vec(target),
@@ -1063,6 +1249,7 @@ class BifrostState(object):
                 v_len(v_sub(eye, target)) - v_len(v_sub(start[0], start[1])),
                 extents - start[3],
                 self.pivot_source if self.pivot_valid else "none",
+                self.max_latency,
             )
         )
 
@@ -1174,6 +1361,7 @@ class BifrostState(object):
             if fresh:
                 self.burst_input = [0.0] * 6
                 self.burst_started_at = now
+                self.max_latency = self.last_latency
             for index in range(6):
                 self.burst_input[index] += acc[index]
         if fresh:
@@ -1291,6 +1479,16 @@ class BifrostState(object):
             self.camera_sets += 1
             self._rate_window_sets += 1
             self.last_written = (eye, target)
+            if config.get("refresh_viewport", True):
+                # Setting the camera changes what the viewport should show. It
+                # does not by itself make Fusion draw it. On this machine the
+                # camera provably moves at 30 Hz with the window hidden, so if
+                # the picture ever lags behind the puck it is the repaint that
+                # is missing, not the maths and not the event.
+                try:
+                    viewport.refresh()
+                except Exception as exc:
+                    self.log.debug("viewport.refresh() unavailable (%s)" % exc)
         except Exception as exc:
             self.log.warn("camera update rejected: %s" % exc)
             return
@@ -1303,7 +1501,8 @@ class BifrostState(object):
             if self._rate_window_sets >= 3:
                 self.log.info(
                     "camera update rate: %.1f Hz (%d sets in %.2f s), "
-                    "eye=(%.3f, %.3f, %.3f) dist=%.3f extents=%.4f"
+                    "eye=(%.3f, %.3f, %.3f) dist=%.3f extents=%.4f "
+                    "lat=%.3f stalls=%d"
                     % (
                         self._rate_window_sets / elapsed,
                         self._rate_window_sets,
@@ -1313,6 +1512,8 @@ class BifrostState(object):
                         eye[2],
                         v_len(v_sub(eye, target)),
                         camera.viewExtents,
+                        self.last_latency,
+                        self.stalls,
                     )
                 )
             self._rate_window_start = now
@@ -1327,6 +1528,13 @@ class BifrostEventHandler(adsk.core.CustomEventHandler):
         state = _state
         if state is None:
             return
+        # How long this event sat in Fusion's queue before the main loop got
+        # round to it. With the loop asleep that is seconds, and the accumulator
+        # hands the whole wait to the camera in one step.
+        latency = max(0.0, time.time() - state.fired_at)
+        state.last_latency = latency
+        if latency > state.max_latency:
+            state.max_latency = latency
         try:
             state.apply()
         except Exception:
@@ -1355,6 +1563,17 @@ def run(context):
         _state.handler = BifrostEventHandler()
         _state.custom_event.add(_state.handler)
         _state.log.info("custom event %s registered" % CUSTOM_EVENT_ID)
+
+        # run() is called on Fusion's main thread, which is the only place the
+        # thread id and the top level window can be read.
+        waker = MainLoopWaker(_state.log)
+        if waker.prepare():
+            _state.waker = waker
+        else:
+            _state.log.warn(
+                "wake: unavailable, camera updates will only run when "
+                "something else wakes Fusion's main loop"
+            )
 
         for target, name in (
             (_state.reader_loop, "bifrost-reader"),
@@ -1406,7 +1625,13 @@ def stop(context):
         except Exception:
             pass
         state.log.info(
-            "Bifrost add-in stopped (%d camera updates total)" % state.camera_sets
+            "Bifrost add-in stopped (%d camera updates total, %d wake posts, "
+            "%d stalls)"
+            % (
+                state.camera_sets,
+                state.waker.posts if state.waker else 0,
+                state.stalls,
+            )
         )
     except Exception:
         try:

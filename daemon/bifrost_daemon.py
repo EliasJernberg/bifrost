@@ -185,6 +185,17 @@ DEFAULTS = {
         # A pause this long ends one movement and starts the next, which is when
         # the auto pivot is allowed to move.
         "idle_gap_seconds": 0.5,
+        # fireCustomEvent only queues the event. Fusion's Qt loop sleeps until a
+        # window message arrives, and a SpaceMouse produces none, so the add-in
+        # posts a do-nothing message after every fire. "both", "thread",
+        # "window" or "off".
+        "wake_main_loop": "both",
+        # Ask Fusion to repaint after each camera set. Moving the camera
+        # and drawing the result are two different things.
+        "refresh_viewport": True,
+        # Warn in the add-in log when a fired event has not been handled for
+        # this long, which is the symptom of the loop sleeping.
+        "stall_warn_seconds": 0.5,
         "world_up": [0.0, 0.0, 1.0],
         # Keep at least this many degrees between the view direction and
         # world_up in turntable mode, so elevation is clamped to +/- 89 degrees.

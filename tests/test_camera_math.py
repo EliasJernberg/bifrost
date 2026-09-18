@@ -96,6 +96,7 @@ class FakeViewport(object):
         self.width = 1600
         self.height = 900
         self.fit_calls = 0
+        self.refresh_calls = 0
 
     @property
     def camera(self):
@@ -125,6 +126,9 @@ class FakeViewport(object):
 
     def fit(self):
         self.fit_calls += 1
+
+    def refresh(self):
+        self.refresh_calls += 1
 
 
 class FakeBoundingBox(object):
@@ -879,6 +883,38 @@ def test_speed_defaults():
     )
 
 
+def test_viewport_refresh():
+    """Moving the camera and drawing the result are two different things."""
+    print("repaint")
+    state = new_state()
+    viewport = state.app.activeViewport
+    with state.lock:
+        state.acc[axis_of("yaw")] = 0.1
+    state.apply()
+    check(
+        viewport.refresh_calls == 1,
+        "a camera update asks Fusion to repaint (%d)" % viewport.refresh_calls,
+    )
+    before = viewport.refresh_calls
+    for _ in range(5):
+        state.apply()
+    check(
+        viewport.refresh_calls == before,
+        "an idle frame does not ask for a repaint",
+    )
+
+    state = new_state()
+    state.config["refresh_viewport"] = False
+    viewport = state.app.activeViewport
+    with state.lock:
+        state.acc[axis_of("yaw")] = 0.1
+    state.apply()
+    check(
+        viewport.refresh_calls == 0 and state.camera_sets == 1,
+        "refresh_viewport false still moves the camera, just does not repaint",
+    )
+
+
 def test_idle_is_free():
     print("idle")
     state = new_state()
@@ -900,6 +936,7 @@ def main():
     test_cross_talk()
     test_speed_defaults()
     test_bursts()
+    test_viewport_refresh()
     test_button_fit()
     test_message_handling()
     test_idle_is_free()

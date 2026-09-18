@@ -73,6 +73,9 @@
     "selftest_settle_seconds": 15.0,
     "orbit_pivot": "auto",
     "idle_gap_seconds": 0.5,
+    "wake_main_loop": "both",
+    "refresh_viewport": true,
+    "stall_warn_seconds": 0.5,
     "selftest_pan": 0.0,
     "selftest_zoom": 0.0,
     "selftest_fit": true
