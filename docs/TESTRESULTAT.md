@@ -385,7 +385,23 @@ sanna verifierades genom att spela upp de fem riktiga rorelserna mot Fusion:
 Med `orbit_pivot: "auto"` loggade varje burst `pivot=model`, och under de tva
 rotationsburstarna flyttade sig kamerans target 1,94 respektive 2,99 cm. Target
 kan bara rora sig om orbiten gar kring nagot annat an target, alltsa kring
-modellens boundingbox-centrum. Uppslaget kostade 1 ms per rorelse.
+modellens boundingbox-centrum. Uppslaget kostar 1 till 23 ms per rorelse.
+
+Bildbevis: sjalvtestet kordes tva ganger med `selftest_pan: 0.25`, som skjuter
+modellen ur target innan det skriptade varvet, en gang per pivotlage.
+
+![Auto mot target](pivot-auto-vs-target.jpg)
+
+Modellens tyngdpunkt i de fem renderade rutorna vandrar **4,6 procent** av
+bildbredden med `"auto"` och **35,5 procent** med `"target"`. Resten av rorelsen
+i auto-raden ar att silhuetten andrar form nar ladan snurrar.
+
+Forsta forsoket misslyckades pa ett larorikt satt: `rootComponent.boundingBox`
+tacker hela designen, dolda kroppar inraknade, och i ett dokument dar nagot
+osynligt lag langt bort hamnade pivoten 8 cm fel sa att modellen svepte ut ur
+vyn anda. Add-inet unionerar darfor boxarna for det som faktiskt ar synligt
+(elva objekt, 23 ms i det har dokumentet) och tar hela designens box forst nar
+inget synligt finns.
 
 ### Kalibreringsverktyget
 

@@ -122,16 +122,36 @@ class FakeBoundingBox(object):
         self.maxPoint = FakePoint3D(*high)
 
 
-class FakeComponent(object):
-    def __init__(self, box):
+class FakeBody(object):
+    def __init__(self, box, visible=True):
         self.boundingBox = box
+        self.isVisible = visible
+
+
+class FakeCollection(object):
+    def __init__(self, items):
+        self.items = items
+
+    @property
+    def count(self):
+        return len(self.items)
+
+    def item(self, index):
+        return self.items[index]
+
+
+class FakeComponent(object):
+    def __init__(self, box, bodies=None):
+        self.boundingBox = box
+        if bodies is not None:
+            self.bRepBodies = FakeCollection(bodies)
 
 
 class FakeProduct(object):
     """Stand-in for adsk.fusion.Design, which is what activeProduct returns."""
 
-    def __init__(self, box):
-        self.rootComponent = FakeComponent(box)
+    def __init__(self, box, bodies=None):
+        self.rootComponent = FakeComponent(box, bodies)
 
 
 class FakeApplication(object):
@@ -434,6 +454,35 @@ def test_orbit_pivot():
     check(
         state.pivot_source == "target" and close(viewport.camera.target.x, 0.0, 1e-6),
         "no design open falls back to the target",
+    )
+
+    # What is hidden must not drag the pivot away from what is on screen.
+    state = new_state()
+    state.app.activeProduct = FakeProduct(
+        FakeBoundingBox((-100, -100, -100), (10, 10, 10)),
+        bodies=[
+            FakeBody(FakeBoundingBox((0, 0, 0), (10, 10, 10)), visible=True),
+            FakeBody(FakeBoundingBox((-100, -100, -100), (-90, -90, -90)), False),
+        ],
+    )
+    state.extra_yaw = 0.01
+    state.apply()
+    check(
+        state.pivot is not None and close(state.pivot[0], 5.0),
+        "a hidden body far away does not move the pivot (%s)" % (state.pivot,),
+    )
+
+    # Nothing visible at all: fall back to the whole design's box.
+    state = new_state()
+    state.app.activeProduct = FakeProduct(
+        FakeBoundingBox((0, 0, 0), (10, 10, 10)),
+        bodies=[FakeBody(FakeBoundingBox((0, 0, 0), (10, 10, 10)), visible=False)],
+    )
+    state.extra_yaw = 0.01
+    state.apply()
+    check(
+        state.pivot is not None and close(state.pivot[0], 5.0),
+        "with nothing visible it falls back to the design box (%s)" % (state.pivot,),
     )
 
     # Pan drags the pivot along, so the next orbit still turns around the same

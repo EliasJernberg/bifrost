@@ -126,6 +126,25 @@ Samma uppspelning bekräftar den automatiska rotationspunkten: varje burst logga
 respektive 2,99 cm. Target kan bara röra sig om orbiten går kring något annat än
 target, alltså kring modellens centrum.
 
+### Rotationspunkten i bild
+
+Add-inets självtest kördes två gånger med `selftest_pan: 0.25`, som skjuter
+modellen ur kamerans target innan det skriptade varvet, en gång per pivotläge:
+
+![Auto mot target](pivot-auto-vs-target.jpg)
+
+Modellens tyngdpunkt i de fem renderade rutorna vandrar **4,6 procent** av
+bildbredden med `orbit_pivot: "auto"` och **35,5 procent** med `"target"`.
+Resten av rörelsen i auto-raden är att silhuetten ändrar form när lådan snurrar,
+inte att den flyttar sig.
+
+En sak som mätningen avslöjade på vägen: `rootComponent.boundingBox` täcker hela
+designen, dolda kroppar inräknade. I ett dokument där något osynligt låg långt
+från det man tittade på hamnade pivoten 8 cm fel och modellen svepte ut ur vyn.
+Add-inet unionerar därför boxarna för det som faktiskt är synligt, och faller
+tillbaka på hela designens box först när det inte finns något synligt att gå på.
+Kostnaden är 23 ms för elva synliga objekt, en gång per rörelse.
+
 ---
 
 ## 4. Vad som fortfarande är obekräftat

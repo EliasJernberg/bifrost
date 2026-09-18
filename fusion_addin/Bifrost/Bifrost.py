@@ -323,7 +323,10 @@ class BifrostState(object):
         elif kind == "hello":
             self.apply_config(message.get("addin"))
         elif kind == "ping":
-            self.log.debug("ping")
+            # Keepalive. Deliberately not logged: debug level is there to show
+            # what each movement did to the camera, and a line every five
+            # seconds would bury exactly that.
+            pass
 
     # -- pacing thread -------------------------------------------------
 
@@ -591,12 +594,15 @@ class BifrostState(object):
                 return None
         return centre
 
-    def occurrence_centre(self, root):
-        """Fallback centre: union the boxes of what is visible in the root.
+    def visible_centre(self, root):
+        """Centre of what is actually visible in the root component.
 
-        Component.boundingBox is one native call and covers the whole assembly,
-        so it is tried first. This walk only runs when that call is missing or
-        returns nothing, for instance in a design that holds only sketches.
+        Component.boundingBox is one native call, but it covers everything the
+        design holds, hidden bodies and switched off occurrences included. On a
+        design where something invisible sits far from the part being worked on,
+        that box centre is nowhere near what is on screen, and orbiting around
+        it throws the model off the view. So the visible items are unioned by
+        hand, and the whole design box is only the fallback.
         """
         low = None
         high = None
@@ -633,7 +639,11 @@ class BifrostState(object):
                         high[axis] = max(high[axis], maxs[axis])
         if low is None:
             return None
-        self.log.debug("pivot: unioned %d visible items" % count)
+        self.log.debug(
+            "pivot: unioned %d visible items, box (%.2f, %.2f, %.2f) to "
+            "(%.2f, %.2f, %.2f)"
+            % (count, low[0], low[1], low[2], high[0], high[1], high[2])
+        )
         return tuple((low[axis] + high[axis]) / 2.0 for axis in range(3))
 
     def model_centre(self):
@@ -660,19 +670,28 @@ class BifrostState(object):
         if root is None:
             return None
         started = time.time()
-        centre = None
-        try:
-            centre = self.box_centre(root.boundingBox)
-        except Exception as exc:
-            self.log.debug("pivot: rootComponent.boundingBox failed (%s)" % exc)
+        centre = self.visible_centre(root)
+        source = "visible"
         if centre is None:
-            centre = self.occurrence_centre(root)
+            # Nothing visible to union, or the collections were not there. Fall
+            # back to the whole design's box, which at least exists.
+            source = "whole design"
+            try:
+                centre = self.box_centre(root.boundingBox)
+            except Exception as exc:
+                self.log.debug("pivot: rootComponent.boundingBox failed (%s)" % exc)
         if centre is None:
-            self.log.debug("pivot: nothing visible to centre on, using target")
+            self.log.debug("pivot: nothing to centre on, using target")
             return None
         self.log.debug(
-            "pivot: model centre (%.3f, %.3f, %.3f) in %.0f ms"
-            % (centre[0], centre[1], centre[2], (time.time() - started) * 1000.0)
+            "pivot: model centre (%.3f, %.3f, %.3f) from the %s in %.0f ms"
+            % (
+                centre[0],
+                centre[1],
+                centre[2],
+                source,
+                (time.time() - started) * 1000.0,
+            )
         )
         return centre
 

@@ -205,7 +205,11 @@ is in [docs/AXELMATRIS.md](docs/AXELMATRIS.md).
 ### The orbit pivot
 
 With `orbit_pivot: "auto"`, the first orbit after a pause of `idle_gap_seconds`
-looks up the bounding box of the visible model and turns around its centre.
+unions the bounding boxes of everything visible in the design and turns around
+the centre of that. Visible is the operative word: the whole design's box, which
+is one cheap call, includes hidden bodies, and a hidden body parked far from
+what you are working on drags the pivot off the model. That box is only the
+fallback for when nothing visible can be found.
 Panning drags that pivot along, so orbiting after a pan still turns around the
 same point of the model. It falls back to the camera target, which is what the
 first versions always did, when no design is open or nothing in it is visible.
@@ -243,7 +247,9 @@ single axis bursts, plus and minus on all six axes, which is what the axis matri
 was measured with.
 
 Measured results for all of it, including what happens inside Fusion, are in
-[docs/TESTRESULTAT.md](docs/TESTRESULTAT.md) (Swedish).
+[docs/TESTRESULTAT.md](docs/TESTRESULTAT.md) (Swedish), and the axis by axis
+measurement behind the default mapping is in
+[docs/AXELMATRIS.md](docs/AXELMATRIS.md) (Swedish).
 
 Setting `"selftest": true` makes the add-in drive a scripted 360 degree orbit
 as soon as a design is open, and render the viewport at 0, 90, 180, 270 and 360
@@ -314,9 +320,9 @@ clients at once and Bifrost is just one more. If it does, restart spacenavd.
   `Viewport.viewToModelSpace`. If a future Fusion drops that call, the add-in
   falls back to the eye-to-target distance, and panning in an orthographic view
   will no longer track the zoom level.
-* The auto pivot reads `rootComponent.boundingBox`, which covers the whole
-  design rather than only what is inside the viewport. Zoom into a corner of a
-  big assembly and the orbit still turns around the centre of the whole thing.
+* The auto pivot covers everything visible in the design, not only what is
+  inside the viewport. Zoom into a corner of a big assembly and the orbit still
+  turns around the centre of the whole visible model.
 * `log_level: "debug"` adds two lines per movement, before and after, with the
   camera and the integrated input. That is how the axis matrix was measured, and
   it is the first thing to turn on when a motion behaves oddly.
