@@ -4,10 +4,17 @@
 Fusion 360 running under Wine cannot talk to 3Dconnexion HID hardware, because
 3DxWare does not run there. Bifrost sidesteps HID completely: this daemon runs
 natively on Linux, reads 6DoF events from the spacenavd UNIX socket, applies
-deadzone, gain and inversion, and serves the result as newline delimited JSON
-over TCP on 127.0.0.1. The Fusion add-in connects to that port from inside the
-Wine prefix (TCP over loopback crosses the Wine boundary fine) and drives the
-viewport camera.
+deadzone, a response curve, gain, inversion, dominant group gating and light
+smoothing, and serves the result as newline delimited JSON over TCP on
+127.0.0.1. The Fusion add-in connects to that port from inside the Wine prefix
+(TCP over loopback crosses the Wine boundary fine) and drives the viewport
+camera.
+
+The shaping matters as much as the plumbing: a SpaceMouse reports all six axes
+on every push, so a linear map turns one nudge into a simultaneous orbit, pan
+and zoom. Bifrost squares the normalised magnitude, keeps only the strongest of
+rotate / translate / zoom per frame, and drops the axes inside that group that
+are carrying a fraction of the leading one.
 
 Standard library only. Tested on Python 3.9 and newer.
 
@@ -42,6 +49,7 @@ so running this alongside KiCad is fine.
 import argparse
 import errno
 import json
+import math
 import os
 import socket
 import struct
@@ -64,6 +72,28 @@ UEV_RAWAXIS = 5
 UEV_RAWBUTTON = 6
 
 AXES = ("x", "y", "z", "rx", "ry", "rz")
+
+# Which camera motions belong together. A SpaceMouse leaks a little of every
+# push into all six axes, so the shaping stage picks one group per frame and
+# drops the rest: you are either turning the model, sliding it or zooming, never
+# all three at once by accident. Measured cross talk on this hardware is in
+# docs/AXELMATRIS.md.
+MOTION_GROUPS = (
+    ("rotate", ("pitch", "yaw", "roll")),
+    ("translate", ("pan_x", "pan_y")),
+    ("zoom", ("dolly",)),
+)
+
+# The add-in config key that decides whether a motion does anything at all. A
+# motion with speed zero must never win the dominance contest.
+MOTION_SPEED_KEY = {
+    "pitch": "orbit_speed",
+    "yaw": "orbit_speed",
+    "roll": "roll_speed",
+    "pan_x": "pan_speed",
+    "pan_y": "pan_speed",
+    "dolly": "zoom_speed",
+}
 
 DEFAULT_CONFIG_PATH = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
@@ -92,6 +122,24 @@ DEFAULTS = {
             "ry": False,
             "rz": False,
         },
+        # Feel. This is what keeps a single nudge from driving all six axes at
+        # once, see README "Response and cross talk".
+        "response": {
+            # 1.0 is a straight line from deadzone to full scale, 2.0 squares
+            # it, 3.0 cubes it. Higher means fine control around centre and the
+            # same top speed at full deflection.
+            "exponent": 2.0,
+            # Inside the winning group, an axis carrying less than this fraction
+            # of the leading axis is dropped.
+            "axis_cut": 0.1,
+            # Only one of rotate / translate / zoom survives each frame.
+            "dominant_group": True,
+            # ... and the group that is already winning keeps winning until
+            # another one beats it by this factor, so a gesture cannot flicker.
+            "dominant_hysteresis": 1.25,
+            # Exponential smoothing time constant in seconds, 0 disables it.
+            "smoothing_seconds": 0.05,
+        },
         "verbose": False,
     },
     # Everything below is passed straight through to the Fusion add-in in the
@@ -119,12 +167,15 @@ DEFAULTS = {
             "yaw": True,
             "roll": False,
         },
-        # Radians per unit of accumulated normalised input.
-        "orbit_speed": 2.5,
-        # Fractions of the visible viewport width per unit of input.
+        # Radians per unit of accumulated normalised input, so also radians per
+        # second at full deflection: pi/2 is a quarter turn a second.
+        "orbit_speed": 1.5708,
+        # Fractions of the visible viewport width per unit of input, so one
+        # full viewport width a second at full deflection.
         "pan_speed": 1.0,
-        # e-folds of view scale per unit of input.
-        "zoom_speed": 1.2,
+        # e-folds of view scale per unit of input. ln(2) is a factor two a
+        # second at full deflection.
+        "zoom_speed": 0.6931,
         "roll_speed": 0.0,
         # "free" orbits around the camera up vector, "turntable" around world_up.
         "orbit_mode": "turntable",
@@ -135,9 +186,9 @@ DEFAULTS = {
         # the auto pivot is allowed to move.
         "idle_gap_seconds": 0.5,
         "world_up": [0.0, 0.0, 1.0],
-        # Keep at least this many degrees between the view direction and world_up
-        # in turntable mode.
-        "pitch_limit_deg": 2.0,
+        # Keep at least this many degrees between the view direction and
+        # world_up in turntable mode, so elevation is clamped to +/- 89 degrees.
+        "pitch_limit_deg": 1.0,
         "min_distance": 0.01,
         # Button number that triggers viewport.fit(). -1 disables, "first" learns
         # the first button ever seen.
@@ -148,9 +199,15 @@ DEFAULTS = {
         # Viewport widths of pan before the scripted orbit, so the rendered
         # frames show whether the orbit still turns around the model.
         "selftest_pan": 0.0,
+        # e-folds of zoom the self test applies after the orbit, rendered both
+        # ways, so the pictures cover all three motions.
+        "selftest_zoom": 0.0,
+        # Fit the view before the self test runs, so its rendered frames are
+        # framed the same way whatever camera Fusion restored.
+        "selftest_fit": True,
         "selftest_wait_seconds": 600.0,
         "selftest_image_dir": "",
-        "selftest_settle_seconds": 3.0,
+        "selftest_settle_seconds": 15.0,
         "log_path": "",
         "log_level": "info",
     },
@@ -297,15 +354,33 @@ class Bridge(object):
         self._threads = []
         self.stats_frames = 0
         self.stats_motion_in = 0
+        # Shaping state, emitter thread only.
+        self._ema = [0.0] * 6
+        self._dominant = None
 
     # -- normalisation -----------------------------------------------------
 
     def _normalise(self, raw, cfg):
+        """Raw counts to a signed magnitude, deadzoned and put through the curve.
+
+        The curve is the whole point: a straight line makes every stray count a
+        camera movement, while squaring the normalised magnitude leaves full
+        deflection untouched and pushes the cross talk near the deadzone down
+        into nothing. 60 counts next to a 350 count push goes from 19 percent of
+        full speed to under 1 percent.
+        """
         deadzone = float(cfg.get("deadzone", 0))
         full_scale = float(cfg.get("full_scale", 350))
         sensitivity = float(cfg.get("sensitivity", 1.0))
         gains = cfg.get("axis_gain", {})
         inverts = cfg.get("axis_invert", {})
+        response = cfg.get("response", {}) or {}
+        try:
+            exponent = float(response.get("exponent", 2.0))
+        except (TypeError, ValueError):
+            exponent = 2.0
+        if exponent < 1.0:
+            exponent = 1.0
         span = max(1.0, full_scale - deadzone)
         out = []
         for index, name in enumerate(AXES):
@@ -315,8 +390,10 @@ class Bridge(object):
                 out.append(0.0)
                 continue
             scaled = (magnitude - deadzone) / span
-            if scaled > 1.5:
-                scaled = 1.5
+            if scaled > 1.0:
+                scaled = 1.0
+            if exponent != 1.0:
+                scaled = scaled**exponent
             if value < 0:
                 scaled = -scaled
             scaled *= float(gains.get(name, 1.0)) * sensitivity
@@ -324,6 +401,126 @@ class Bridge(object):
                 scaled = -scaled
             out.append(round(scaled, 5))
         return out
+
+    # -- shaping -----------------------------------------------------------
+
+    @staticmethod
+    def axis_groups(addin):
+        """Axis indices per motion group, skipping motions that do nothing.
+
+        Built from the add-in's own map, so a recalibrated puck groups itself
+        correctly. Roll is left out in turntable mode and any motion whose speed
+        is zero is left out too: an axis that cannot move the camera must never
+        win the dominance contest and silence the axis that can.
+        """
+        mapping = addin.get("map", {}) or {}
+        turntable = addin.get("orbit_mode", "turntable") == "turntable"
+        groups = {}
+        for group, motions in MOTION_GROUPS:
+            indices = []
+            for motion in motions:
+                if motion == "roll" and turntable:
+                    continue
+                try:
+                    speed = float(addin.get(MOTION_SPEED_KEY[motion], 0.0))
+                except (TypeError, ValueError):
+                    speed = 0.0
+                if speed == 0.0:
+                    continue
+                axis = mapping.get(motion)
+                if axis in AXES:
+                    index = AXES.index(axis)
+                    if index not in indices:
+                        indices.append(index)
+            if indices:
+                groups[group] = indices
+        return groups
+
+    def _gate(self, values, groups, response):
+        """Keep one motion group, and inside it only the axes that carry it."""
+        if not groups:
+            self._dominant = None
+            return list(values)
+        out = [0.0] * 6
+        strength = dict(
+            (name, max(abs(values[i]) for i in indices))
+            for name, indices in groups.items()
+        )
+        if max(strength.values()) <= 0.0:
+            self._dominant = None
+            return out
+        if response.get("dominant_group", True):
+            winner = max(strength, key=lambda name: (strength[name], name))
+            previous = self._dominant
+            try:
+                hysteresis = float(response.get("dominant_hysteresis", 1.25))
+            except (TypeError, ValueError):
+                hysteresis = 1.25
+            if hysteresis < 1.0:
+                hysteresis = 1.0
+            if (
+                previous is not None
+                and previous in strength
+                and previous != winner
+                and strength[previous] > 0.0
+                and strength[winner] < strength[previous] * hysteresis
+            ):
+                winner = previous
+            self._dominant = winner
+            winners = [winner]
+        else:
+            self._dominant = None
+            winners = list(groups)
+        try:
+            cut = float(response.get("axis_cut", 0.1))
+        except (TypeError, ValueError):
+            cut = 0.1
+        for name in winners:
+            top = strength[name]
+            if top <= 0.0:
+                continue
+            for index in groups[name]:
+                if abs(values[index]) >= cut * top:
+                    out[index] = values[index]
+        return out
+
+    def _smooth(self, values, response, dt):
+        """Exponential smoothing, so the puck's own jitter is not a camera move."""
+        try:
+            tau = float(response.get("smoothing_seconds", 0.05))
+        except (TypeError, ValueError):
+            tau = 0.05
+        if tau <= 0.0:
+            self._ema = list(values)
+            return list(values)
+        alpha = 1.0 - math.exp(-dt / tau)
+        out = []
+        for index in range(6):
+            level = self._ema[index] + (values[index] - self._ema[index]) * alpha
+            # An exponential never actually reaches zero, and a stream that
+            # never goes quiet would keep the add-in's burst open forever.
+            if values[index] == 0.0 and abs(level) < 1e-3:
+                level = 0.0
+            self._ema[index] = level
+            out.append(round(level, 5))
+        return out
+
+    def shape(self, raw, cfg, addin, dt):
+        """Raw counts to the values that go on the wire."""
+        values = self._normalise(raw, cfg)
+        response = cfg.get("response", {}) or {}
+        gated = self._gate(values, self.axis_groups(addin), response)
+        smoothed = self._smooth(gated, response, dt)
+        if any(value != 0.0 for value in values):
+            # While the puck is deflected, nothing outside the winning group
+            # leaves the daemon, not even a smoothing tail. Going from an orbit
+            # straight into a pan has to stop the orbit, not blend the two, and
+            # the tail has to be forgotten rather than surface again on release.
+            for index in range(6):
+                if gated[index] == 0.0:
+                    self._ema[index] = 0.0
+                    smoothed[index] = 0.0
+        return smoothed
 
     # -- spacenavd side ----------------------------------------------------
 
@@ -451,7 +648,7 @@ class Bridge(object):
 
             with self._state_lock:
                 raw = list(self._raw)
-            values = self._normalise(raw, cfg)
+            values = self.shape(raw, cfg, self.config.section("addin"), dt)
             nonzero = any(v != 0.0 for v in values)
             if nonzero or self._last_nonzero:
                 self.hub.broadcast({"t": "m", "v": values, "dt": round(dt, 5)})

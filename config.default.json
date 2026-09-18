@@ -24,6 +24,13 @@
       "ry": false,
       "rz": false
     },
+    "response": {
+      "exponent": 2.0,
+      "axis_cut": 0.1,
+      "dominant_group": true,
+      "dominant_hysteresis": 1.25,
+      "smoothing_seconds": 0.05
+    },
     "verbose": false
   },
   "addin": {
@@ -44,9 +51,9 @@
       "yaw": true,
       "roll": false
     },
-    "orbit_speed": 2.5,
+    "orbit_speed": 1.5708,
     "pan_speed": 1.0,
-    "zoom_speed": 1.2,
+    "zoom_speed": 0.6931,
     "roll_speed": 0.0,
     "orbit_mode": "turntable",
     "world_up": [
@@ -54,7 +61,7 @@
       0.0,
       1.0
     ],
-    "pitch_limit_deg": 2.0,
+    "pitch_limit_deg": 1.0,
     "min_distance": 0.01,
     "fit_button": 5,
     "selftest": false,
@@ -63,9 +70,11 @@
     "log_level": "info",
     "selftest_wait_seconds": 600.0,
     "selftest_image_dir": "",
-    "selftest_settle_seconds": 3.0,
+    "selftest_settle_seconds": 15.0,
     "orbit_pivot": "auto",
     "idle_gap_seconds": 0.5,
-    "selftest_pan": 0.0
+    "selftest_pan": 0.0,
+    "selftest_zoom": 0.0,
+    "selftest_fit": true
   }
 }
